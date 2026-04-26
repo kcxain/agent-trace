@@ -196,6 +196,7 @@ The export writes `training.jsonl`. Each row is one reconstructed turn and inclu
 - timing fields such as turn duration and time to first token
 - captured API request/response events linked to the turn
 - `rollout_index` fields that point back to the exact Codex rollout JSONL line order
+- `raw_model_requests` when `/v1/responses` or `/v1/chat/completions` request bodies were captured by the proxy
 
 Training export redacts sensitive header-like fields by default, including `authorization`, cookies, API keys, and token fields. For a fully private, controlled dataset you can opt into the unredacted export:
 
@@ -205,7 +206,7 @@ agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS train
 
 Treat unredacted exports as secrets.
 
-For Codex login-mode sessions, `agent-trace` treats Codex rollout `response_item.message` entries as the authoritative recorded model input and rollout `agent_message` / tool events as the authoritative recorded output stream. The local proxy still captures HTTP requests it can see, but the raw model HTTP payload is only marked as captured when `/v1/responses` or `/v1/chat/completions` traffic is actually present. Check `trace.provenance.raw_model_http_request_captured` in `training.jsonl`.
+For Codex login-mode sessions, use `--capture-model-requests` when you need wire-level model payloads. When capture succeeds, `training.jsonl` sets `trace.provenance.prompt_source` to the proxy-captured `/v1/responses` request body and stores the decoded request in `raw_model_requests`. If the login token is rejected by the OpenAI Responses API, request bodies can still be captured, but successful model responses will be absent; check `trace.provenance.raw_model_http_success_events`.
 
 ## Notes
 

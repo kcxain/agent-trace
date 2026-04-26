@@ -6,6 +6,8 @@ import net from "node:net";
 import tls from "node:tls";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
@@ -1449,11 +1451,21 @@ function compactApiEvent(event, index, includeSensitive = false) {
   };
 }
 
+function isRawModelHttpEvent(event) {
+  return /\/v1\/(responses|chat\/completions)\b/.test(requestEventUrl(event));
+}
+
+function hasCapturedRequestBody(event) {
+  return event?.request?.body != null || Boolean(event?.request?.body_base64);
+}
+
 function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, events, includeSensitive }) {
   const meta = sessionMetaFromRollout(rollout);
-  const rawModelEvents = (events || []).filter((event) => {
-    const url = requestEventUrl(event);
-    return /\/v1\/(responses|chat\/completions)\b/.test(url);
+  const rawModelEvents = (turn.api_events || []).filter(isRawModelHttpEvent);
+  const rawModelRequestBodyEvents = rawModelEvents.filter(hasCapturedRequestBody);
+  const rawModelSuccessEvents = rawModelEvents.filter((event) => {
+    const status = Number(requestEventStatus(event));
+    return status >= 200 && status < 300;
   });
   const promptMessages = [];
   if (meta.base_instructions?.text) promptMessages.push({ role: "system", source: "session_meta.base_instructions", timestamp: meta.timestamp || "", content: meta.base_instructions.text });
@@ -1489,6 +1501,7 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
     };
   });
   const apiEvents = (turn.api_events || []).map((event) => compactApiEvent(event, event._traceIndex || events.indexOf(event) + 1, includeSensitive));
+  const rawModelRequests = rawModelRequestBodyEvents.map((event) => compactApiEvent(event, event._traceIndex || events.indexOf(event) + 1, includeSensitive));
   return {
     schema: "agent-trace.training.v1",
     trace: {
@@ -1500,11 +1513,13 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
       finished_at: runMeta.finished_at || "",
       auth_mode: runMeta.auth_mode || "",
       provenance: {
-        prompt_source: "codex_rollout.response_item.message plus session_meta.base_instructions",
-        output_source: "codex_rollout.event_msg.agent_message and response_item tool events",
+        prompt_source: rawModelRequestBodyEvents.length ? "agent-trace proxy /v1/responses request body" : "codex_rollout.response_item.message plus session_meta.base_instructions",
+        output_source: rawModelSuccessEvents.length ? "agent-trace proxy /v1/responses response body or websocket frames" : "codex_rollout.event_msg.agent_message and response_item tool events",
         api_source: "agent-trace local forwarding proxy logs",
         raw_model_http_events: rawModelEvents.length,
         raw_model_http_request_captured: rawModelEvents.length > 0,
+        raw_model_http_request_body_captured: rawModelRequestBodyEvents.length > 0,
+        raw_model_http_success_events: rawModelSuccessEvents.length,
       },
     },
     session: {
@@ -1538,6 +1553,7 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
     },
     tool_calls: toolCalls,
     raw_turn_context: includeSensitive ? turn.context || null : redactSensitive(turn.context || null),
+    raw_model_requests: rawModelRequests,
     api_events: apiEvents,
   };
 }
@@ -1572,6 +1588,13 @@ function validateTrace(runDir) {
     if (loaded.rollouts.length && !loaded.rollouts.some((rollout) => !isSubagentRollout(rollout))) errors.push("codex trace has no main rollout");
   }
   if (loaded.rawDumps.length && loaded.events.length && loaded.rawDumps.length !== loaded.events.length) warnings.push(`raw dump count (${loaded.rawDumps.length}) differs from normalized event count (${loaded.events.length})`);
+  const rawModelEvents = loaded.events.filter(isRawModelHttpEvent);
+  const rawModelRequestBodyEvents = rawModelEvents.filter(hasCapturedRequestBody);
+  const rawModelSuccessEvents = rawModelEvents.filter((event) => {
+    const status = Number(requestEventStatus(event));
+    return status >= 200 && status < 300;
+  });
+  if (rawModelEvents.length && !rawModelSuccessEvents.length) warnings.push("raw model HTTP requests were captured, but no successful model response was captured");
 
   let turnCount = 0;
   let toolCount = 0;
@@ -1626,6 +1649,9 @@ function validateTrace(runDir) {
       tool_calls: toolCount,
       edit_tool_calls: editToolCount,
       ordering_issues: orderingIssues,
+      raw_model_http_events: rawModelEvents.length,
+      raw_model_http_request_body_events: rawModelRequestBodyEvents.length,
+      raw_model_http_success_events: rawModelSuccessEvents.length,
     },
     errors,
     warnings,
@@ -1865,10 +1891,33 @@ function readRequestBody(req) {
   });
 }
 
+function headerValue(headers, name) {
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === lower) return Array.isArray(value) ? value.join(", ") : String(value || "");
+  }
+  return "";
+}
+
+function decodeBodyBuffer(buffer, headers) {
+  const encoding = headerValue(headers, "content-encoding").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean).pop() || "";
+  if (!buffer.length || !encoding || encoding === "identity") return { buffer, encoding };
+  try {
+    if (encoding === "gzip" || encoding === "x-gzip") return { buffer: zlib.gunzipSync(buffer), encoding };
+    if (encoding === "br") return { buffer: zlib.brotliDecompressSync(buffer), encoding };
+    if (encoding === "deflate") return { buffer: zlib.inflateSync(buffer), encoding };
+    if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") return { buffer: zlib.zstdDecompressSync(buffer), encoding };
+  } catch (error) {
+    return { buffer, encoding, decode_error: String(error) };
+  }
+  return { buffer, encoding, decode_error: `unsupported content-encoding: ${encoding}` };
+}
+
 function parseBody(buffer, headers) {
-  const text = buffer.toString("utf8");
+  const decoded = decodeBodyBuffer(buffer, headers);
+  const text = decoded.buffer.toString("utf8");
   if (!text) return null;
-  if (String(headers["content-type"] || "").includes("application/json")) {
+  if (headerValue(headers, "content-type").includes("application/json")) {
     try {
       return JSON.parse(text);
     } catch {
@@ -1876,6 +1925,21 @@ function parseBody(buffer, headers) {
     }
   }
   return text;
+}
+
+function bodyCapture(buffer, headers) {
+  const decoded = decodeBodyBuffer(buffer, headers);
+  const out = {
+    body: parseBody(buffer, headers),
+  };
+  if (buffer.length) {
+    out.body_base64 = buffer.toString("base64");
+    out.body_sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+  }
+  if (decoded.encoding) out.body_content_encoding = decoded.encoding;
+  if (decoded.decode_error) out.body_decode_error = decoded.decode_error;
+  if (decoded.buffer !== buffer) out.body_decoded_sha256 = crypto.createHash("sha256").update(decoded.buffer).digest("hex");
+  return out;
 }
 
 function writeJsonl(file, event) {
@@ -2031,7 +2095,7 @@ function startForwardProxy({ port, upstreamUrl, openaiUpstreamUrl, runDir, logFi
     const started = Date.now();
     const requestBody = await readRequestBody(req);
     const target = routeTarget(req.url, upstreamUrl, openaiUpstreamUrl);
-    const requestRecord = { timestamp: new Date(started).toISOString(), method: req.method, url: target.toString(), headers: sanitizeHeaders(req.headers), body: parseBody(requestBody, req.headers) };
+    const requestRecord = { timestamp: new Date(started).toISOString(), method: req.method, url: target.toString(), headers: sanitizeHeaders(req.headers), ...bodyCapture(requestBody, req.headers) };
     if (extractToken) {
       for (const token of extractTokenHeaders(req.headers)) {
         writeTokenFile(tokenFile, { timestamp: new Date(started).toISOString(), url: target.toString(), header: token.header, preview: tokenPreview(token.value), value: token.value });
@@ -2050,7 +2114,7 @@ function startForwardProxy({ port, upstreamUrl, openaiUpstreamUrl, runDir, logFi
       }
       res.end();
       const responseBody = Buffer.concat(chunks);
-      const pair = { type: "api_pair", request: requestRecord, response: { timestamp: new Date().toISOString(), status_code: upstreamResponse.status, headers: sanitizeHeaders(responseHeaders), body: parseBody(responseBody, responseHeaders) }, duration_ms: Date.now() - started };
+      const pair = { type: "api_pair", request: requestRecord, response: { timestamp: new Date().toISOString(), status_code: upstreamResponse.status, headers: sanitizeHeaders(responseHeaders), ...bodyCapture(responseBody, responseHeaders) }, duration_ms: Date.now() - started };
       fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(pair, null, 2));
       writeJsonl(logFile, pair);
     } catch (error) {
