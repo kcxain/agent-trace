@@ -244,6 +244,10 @@ function truncateText(value, max = 20000) {
   return text.length > max ? `${text.slice(0, max)}\n\n... <truncated ${text.length - max} chars>` : text;
 }
 
+function fullText(value) {
+  return String(value ?? "");
+}
+
 function parseJsonMaybe(value) {
   if (value == null) return {};
   if (typeof value === "object") return value;
@@ -970,7 +974,7 @@ function renderPromptMessagesForTurn(turn, sessionMeta) {
   const lines = [];
   lines.push("### Prompts Sent To Agent", "");
   if (sessionMeta.base_instructions?.text) {
-    lines.push(detailsBlock("System prompt: base instructions", fence(truncateText(sessionMeta.base_instructions.text), "")), "");
+    lines.push(detailsBlock("System prompt: base instructions", fence(fullText(sessionMeta.base_instructions.text), "")), "");
   }
   const seen = new Set();
   const messages = [];
@@ -983,13 +987,13 @@ function renderPromptMessagesForTurn(turn, sessionMeta) {
   if (messages.length) {
     messages.forEach((message, index) => {
       const title = `Prompt message ${index + 1}: ${message.role}${message.source ? ` (${message.source})` : ""}${message.timestamp ? ` @ ${message.timestamp}` : ""}`;
-      lines.push(detailsBlock(title, fence(truncateText(message.text), message.text.trim().startsWith("{") ? "json" : "")), "");
+      lines.push(detailsBlock(title, fence(fullText(message.text), message.text.trim().startsWith("{") ? "json" : "")), "");
     });
   } else {
     lines.push("No per-turn prompt messages found in rollout.", "");
   }
   if (turn.context?.collaboration_mode?.settings?.developer_instructions) {
-    lines.push(detailsBlock("Developer instructions from turn context", fence(truncateText(turn.context.collaboration_mode.settings.developer_instructions), "")), "");
+    lines.push(detailsBlock("Developer instructions from turn context", fence(fullText(turn.context.collaboration_mode.settings.developer_instructions), "")), "");
   }
   return lines.join("\n");
 }
@@ -1132,7 +1136,7 @@ function renderTurnRequestTable(events) {
   })));
 }
 
-function renderMaybeJsonBlock(value, lang = "json") {
+function renderMaybeJsonBlock(value, lang = "json", { truncate = false } = {}) {
   if (value == null || value === "") return "_empty_";
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -1140,10 +1144,11 @@ function renderMaybeJsonBlock(value, lang = "json") {
     try {
       return fence(JSON.stringify(JSON.parse(trimmed), null, 2), "json");
     } catch {
-      return fence(truncateText(value), "");
+      return fence(truncate ? truncateText(value) : fullText(value), "");
     }
   }
-  return fence(truncateText(JSON.stringify(value, null, 2)), lang);
+  const json = JSON.stringify(value, null, 2);
+  return fence(truncate ? truncateText(json) : json, lang);
 }
 
 function renderHeaders(headers) {
