@@ -29,6 +29,9 @@ Claude-trace compatible options:
   --extract-token                        Capture detected auth headers during agent traffic
   --generate-html <jsonl> [html]         Generate a self-contained HTML report from JSONL
   --generate-md <trace-dir|jsonl> [md]   Generate a Markdown report
+  --export-training-jsonl <trace-dir> [jsonl]
+                                      Export a redacted training-oriented JSONL dataset
+  --validate-trace <trace-dir>           Validate trace completeness and renderability
   --index                                Generate .agent-trace/index.html
   -h, --help                             Show help
 
@@ -63,6 +66,9 @@ function parse(argv) {
     extractToken: false,
     generateHtml: null,
     generateMd: null,
+    exportTrainingJsonl: null,
+    trainingOut: null,
+    validateTrace: null,
     htmlOut: null,
     mdOut: null,
     index: false,
@@ -73,6 +79,7 @@ function parse(argv) {
     auth: "auto",
     baseUrl: null,
     captureModelRequests: false,
+    includeSensitive: false,
     agentArgs: [],
     help: false,
   };
@@ -98,6 +105,11 @@ function parse(argv) {
     } else if (arg === "--generate-md") {
       opts.generateMd = requireValue(rest, ++i, arg);
       if (i + 1 < rest.length && !rest[i + 1].startsWith("--")) opts.mdOut = rest[++i];
+    } else if (arg === "--export-training-jsonl") {
+      opts.exportTrainingJsonl = requireValue(rest, ++i, arg);
+      if (i + 1 < rest.length && !rest[i + 1].startsWith("--")) opts.trainingOut = rest[++i];
+    } else if (arg === "--validate-trace") {
+      opts.validateTrace = requireValue(rest, ++i, arg);
     } else if (arg === "--index") {
       opts.index = true;
     } else if (arg === "--trace-dir") {
@@ -116,6 +128,8 @@ function parse(argv) {
       opts.baseUrl = requireValue(rest, ++i, arg);
     } else if (arg === "--capture-model-requests") {
       opts.captureModelRequests = true;
+    } else if (arg === "--include-sensitive") {
+      opts.includeSensitive = true;
     } else if (arg === "-h" || arg === "--help") {
       opts.help = true;
     } else {
@@ -205,6 +219,10 @@ function looksLikeDiff(text) {
 
 function mdEscapeInline(value) {
   return String(value ?? "").replaceAll("|", "\\|").replace(/\s+/g, " ").trim();
+}
+
+function stripAnsi(value) {
+  return String(value ?? "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 function truncateText(value, max = 20000) {
@@ -409,6 +427,23 @@ function extractTokenHeaders(headers) {
     if (lower === "authorization" || lower === "x-api-key" || lower === "cookie") {
       out.push({ header: key, value: Array.isArray(value) ? value.join(", ") : String(value || "") });
     }
+  }
+  return out;
+}
+
+function isSensitiveKey(key) {
+  const lower = String(key || "").toLowerCase();
+  return ["authorization", "cookie", "set-cookie", "x-api-key", "api-key", "access_token", "refresh_token", "id_token"].includes(lower)
+    || lower.includes("secret")
+    || lower.includes("password");
+}
+
+function redactSensitive(value) {
+  if (Array.isArray(value)) return value.map((item) => redactSensitive(item));
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = isSensitiveKey(key) ? tokenPreview(Array.isArray(item) ? item.join(", ") : item) : redactSensitive(item);
   }
   return out;
 }
@@ -632,6 +667,14 @@ function parentThreadIdFromMeta(meta) {
   return meta?.source?.subagent?.thread_spawn?.parent_thread_id || "";
 }
 
+function agentNicknameFromMeta(meta) {
+  return meta?.agent_nickname || meta?.source?.subagent?.thread_spawn?.agent_nickname || "";
+}
+
+function agentRoleFromMeta(meta) {
+  return meta?.agent_role || meta?.source?.subagent?.thread_spawn?.agent_role || "";
+}
+
 function formatDurationSeconds(seconds) {
   if (!Number.isFinite(seconds)) return "";
   if (seconds < 60) return `${seconds}s`;
@@ -747,7 +790,7 @@ function safeMarkdownFileName(text, fallback = "session") {
 function subagentFileName(rollout, used = new Set()) {
   const meta = sessionMetaFromRollout(rollout);
   const id = meta.id || path.basename(rollout.file || "subagent");
-  const label = meta.agent_nickname || meta.agent_role || "subagent";
+  const label = agentNicknameFromMeta(meta) || agentRoleFromMeta(meta) || "subagent";
   const base = safeMarkdownFileName(`subagent-${label}-${id.slice(0, 8)}`, `subagent-${id.slice(0, 8)}`);
   let name = `${base}.md`;
   let i = 2;
@@ -773,6 +816,17 @@ function subagentInfoFromToolOutput(output) {
   if (!output?.content) return {};
   try {
     const data = JSON.parse(output.content);
+    if (typeof data.content === "string") {
+      try {
+        const nested = JSON.parse(data.content);
+        return {
+          id: nested.agent_id || nested.new_thread_id || nested.agent_path || "",
+          nickname: nested.nickname || nested.new_agent_nickname || "",
+        };
+      } catch {
+        // Fall through to the top-level shape below.
+      }
+    }
     return {
       id: data.agent_id || data.new_thread_id || data.agent_path || "",
       nickname: data.nickname || data.new_agent_nickname || "",
@@ -1136,11 +1190,11 @@ function renderCapturedRequestLog(events, rawDumps, runDir) {
 
 function renderSubagentMarkdown(rollout, runMeta = {}) {
   const meta = sessionMetaFromRollout(rollout);
-  const title = meta.agent_nickname || extractTitleFromRollout(rollout) || "Subagent";
+  const title = agentNicknameFromMeta(meta) || extractTitleFromRollout(rollout) || "Subagent";
   const md = [
     `# Subagent: ${title}`,
     "",
-    `**Type:** ${meta.agent_role || "unknown"}  `,
+    `**Type:** ${agentRoleFromMeta(meta) || "unknown"}  `,
     `**Agent ID:** \`${meta.id || ""}\`  `,
     `**Rollout:** \`${rollout.file || ""}\`  `,
     "",
@@ -1214,7 +1268,7 @@ function renderCc2mdTraceMarkdown({ runDir, runMeta, events, tokens, rollouts, r
     md.push("---", "", "## Subagent Conversations", "");
     for (const [file, sub] of subagentMaps.files.entries()) {
       const subMeta = sessionMetaFromRollout(sub);
-      const desc = subMeta.agent_nickname || subMeta.id || path.basename(sub.file);
+      const desc = agentNicknameFromMeta(subMeta) || subMeta.id || path.basename(sub.file);
       md.push(`- [→ Subagent: ${desc}](${file})`);
     }
     md.push("");
@@ -1362,6 +1416,183 @@ function generateMarkdownFromJsonl(inputFile, outputFile, opts = {}) {
   const events = readJsonl(inputFile);
   fs.writeFileSync(outputFile, renderLegacyJsonlMarkdown({ inputFile, events }));
   return outputFile;
+}
+
+function loadTraceRun(runDir) {
+  const runMetaFile = path.join(runDir, "run.json");
+  const logsFile = path.join(runDir, "logs.jsonl");
+  const rawDir = path.join(runDir, "raw");
+  const tokenFile = path.join(runDir, "tokens.jsonl");
+  const runMeta = fs.existsSync(runMetaFile) ? readJsonFile(runMetaFile) : {};
+  const events = readJsonl(logsFile);
+  const tokens = readJsonl(tokenFile);
+  const rawDumps = walkFiles(rawDir).filter((file) => file.endsWith(".json")).sort().map((file) => ({ file, data: readJsonFile(file) }));
+  const rollouts = readRolloutsForRun(runMeta);
+  return { runDir, runMeta, logsFile, rawDir, tokenFile, events, tokens, rawDumps, rollouts };
+}
+
+function compactApiEvent(event, index, includeSensitive = false) {
+  const source = includeSensitive ? event : redactSensitive(event);
+  return {
+    index,
+    type: source.type || "",
+    method: requestEventMethod(source),
+    url: requestEventUrl(source),
+    status: requestEventStatus(source),
+    timestamp: requestEventTime(source),
+    duration_ms: source.duration_ms ?? null,
+    request: source.request || null,
+    response: source.response || null,
+    error: source.error || null,
+  };
+}
+
+function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, events, includeSensitive }) {
+  const meta = sessionMetaFromRollout(rollout);
+  const promptMessages = [];
+  if (meta.base_instructions?.text) promptMessages.push({ role: "system", source: "session_meta.base_instructions", timestamp: meta.timestamp || "", content: meta.base_instructions.text });
+  for (const message of turn.promptMessages || []) {
+    promptMessages.push({ role: message.role || "unknown", source: message.source || "", timestamp: message.timestamp || "", content: message.text || "" });
+  }
+  if (turn.context?.collaboration_mode?.settings?.developer_instructions) {
+    promptMessages.push({ role: "developer", source: "turn_context.developer_instructions", timestamp: turn.started_at || "", content: turn.context.collaboration_mode.settings.developer_instructions });
+  }
+  const assistantText = turn.assistantParts.filter((part) => part.type === "text" && part.text).map((part) => part.text).join("\n\n");
+  const toolCalls = (turn.toolCalls || []).map((call) => {
+    const output = turn.toolOutputs.get(call.id);
+    return {
+      id: call.id || "",
+      name: call.name || "",
+      timestamp: call.timestamp || "",
+      status: call.status || "",
+      input: includeSensitive ? call.input : redactSensitive(call.input),
+      output: output?.content ? stripAnsi(output.content) : "",
+      output_timestamp: output?.timestamp || "",
+      is_edit: isEditTool(call.name),
+    };
+  });
+  const apiEvents = (turn.api_events || []).map((event) => compactApiEvent(event, event._traceIndex || events.indexOf(event) + 1, includeSensitive));
+  return {
+    schema: "agent-trace.training.v1",
+    trace: {
+      dir: path.resolve(runDir),
+      agent: runMeta.agent || "unknown",
+      command: runMeta.command || "",
+      args: runMeta.args || [],
+      started_at: runMeta.started_at || "",
+      finished_at: runMeta.finished_at || "",
+      auth_mode: runMeta.auth_mode || "",
+    },
+    session: {
+      id: meta.id || "",
+      source: meta.source || "",
+      is_subagent: isSubagentRollout(rollout),
+      parent_thread_id: parentThreadIdFromMeta(meta),
+      agent_role: agentRoleFromMeta(meta),
+      agent_nickname: agentNicknameFromMeta(meta),
+      rollout_file: rollout.file || "",
+      cwd: meta.cwd || turn.context?.cwd || "",
+    },
+    turn: {
+      index: turnIndex,
+      id: turn.turn_id || "",
+      started_at: turn.started_at || "",
+      completed_at: turn.completed_at || "",
+      duration_ms: turn.duration_ms,
+      time_to_first_token_ms: turn.time_to_first_token_ms,
+    },
+    token_usage: {
+      last_turn: turn.usage || null,
+      total: turn.total_usage || null,
+      model_context_window: turn.model_context_window || null,
+      rate_limits: turn.rate_limits || null,
+    },
+    prompt_messages: promptMessages,
+    assistant: {
+      text: assistantText,
+      parts: turn.assistantParts.map((part) => part.type === "tool" ? { type: "tool", call_id: part.call?.id || "", name: part.call?.name || "" } : part),
+    },
+    tool_calls: toolCalls,
+    raw_turn_context: includeSensitive ? turn.context || null : redactSensitive(turn.context || null),
+    api_events: apiEvents,
+  };
+}
+
+function exportTrainingJsonl(runDir, outputFile, opts = {}) {
+  const loaded = loadTraceRun(runDir);
+  const records = [];
+  for (const rollout of loaded.rollouts) {
+    const turns = buildTraceTurns(rollout, isSubagentRollout(rollout) ? [] : loaded.events);
+    turns.forEach((turn, index) => {
+      records.push(trainingRecordForTurn({ ...loaded, rollout, turn, turnIndex: index + 1, includeSensitive: Boolean(opts.includeSensitive) }));
+    });
+  }
+  fs.writeFileSync(outputFile, records.map((record) => JSON.stringify(record)).join("\n") + (records.length ? "\n" : ""));
+  return { outputFile, records, loaded };
+}
+
+function validateTrace(runDir) {
+  const errors = [];
+  const warnings = [];
+  const exists = (file, label, required = true) => {
+    if (fs.existsSync(file)) return true;
+    (required ? errors : warnings).push(`${label} is missing: ${file}`);
+    return false;
+  };
+  exists(runDir, "trace directory");
+  const loaded = loadTraceRun(runDir);
+  exists(path.join(runDir, "run.json"), "run.json");
+  exists(loaded.logsFile, "logs.jsonl", false);
+  if (loaded.runMeta.agent === "codex") {
+    if (!loaded.rollouts.length) errors.push("codex trace has no readable rollout files");
+    if (loaded.rollouts.length && !loaded.rollouts.some((rollout) => !isSubagentRollout(rollout))) errors.push("codex trace has no main rollout");
+  }
+  if (loaded.rawDumps.length && loaded.events.length && loaded.rawDumps.length !== loaded.events.length) warnings.push(`raw dump count (${loaded.rawDumps.length}) differs from normalized event count (${loaded.events.length})`);
+
+  let turnCount = 0;
+  let toolCount = 0;
+  let editToolCount = 0;
+  let turnsWithUsage = 0;
+  let turnsWithPrompt = 0;
+  let subagentCount = 0;
+  for (const rollout of loaded.rollouts) {
+    if (isSubagentRollout(rollout)) subagentCount += 1;
+    const turns = buildTraceTurns(rollout, isSubagentRollout(rollout) ? [] : loaded.events);
+    for (const turn of turns) {
+      turnCount += 1;
+      if (turn.usage) turnsWithUsage += 1;
+      if ((turn.promptMessages || []).length || turn.user) turnsWithPrompt += 1;
+      toolCount += turn.toolCalls.length;
+      editToolCount += turn.toolCalls.filter((call) => isEditTool(call.name)).length;
+      for (const call of turn.toolCalls) {
+        if (call.id && !turn.toolOutputs.has(call.id)) warnings.push(`tool call has no output: ${call.name} ${call.id}`);
+      }
+    }
+  }
+  if (loaded.rollouts.length && !turnCount) errors.push("no conversation turns were reconstructed from rollouts");
+  if (turnCount && !turnsWithPrompt) warnings.push("no prompt messages were reconstructed");
+  if (turnCount && !turnsWithUsage) warnings.push("no model token usage was reconstructed");
+
+  const report = {
+    ok: errors.length === 0,
+    trace_dir: path.resolve(runDir),
+    stats: {
+      agent: loaded.runMeta.agent || "unknown",
+      normalized_events: loaded.events.length,
+      raw_dumps: loaded.rawDumps.length,
+      auth_headers: loaded.tokens.length,
+      rollouts: loaded.rollouts.length,
+      subagents: subagentCount,
+      turns: turnCount,
+      turns_with_token_usage: turnsWithUsage,
+      turns_with_prompt_messages: turnsWithPrompt,
+      tool_calls: toolCount,
+      edit_tool_calls: editToolCount,
+    },
+    errors,
+    warnings,
+  };
+  return report;
 }
 
 function htmlShell({ title, subtitle, runMeta, sections }) {
@@ -1935,6 +2166,20 @@ async function main() {
     }
     const out = opts.mdOut || opts.generateMd.replace(/\.jsonl$/i, ".md");
     console.log(`Markdown report: ${generateMarkdownFromJsonl(opts.generateMd, out, opts)}`);
+    return;
+  }
+  if (opts.exportTrainingJsonl) {
+    const out = opts.trainingOut || path.join(opts.exportTrainingJsonl, "training.jsonl");
+    const result = exportTrainingJsonl(opts.exportTrainingJsonl, out, opts);
+    console.log(`Training JSONL: ${result.outputFile}`);
+    console.log(`Training records: ${result.records.length}`);
+    if (!opts.includeSensitive) console.log("Sensitive header-like fields were redacted. Use --include-sensitive only for private, trusted datasets.");
+    return;
+  }
+  if (opts.validateTrace) {
+    const report = validateTrace(opts.validateTrace);
+    console.log(JSON.stringify(report, null, 2));
+    if (!report.ok) process.exitCode = 1;
     return;
   }
   if (opts.index) {

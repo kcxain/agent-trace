@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "trace": "node ./bin/agent-trace.js",
-    "check": "node --check ./bin/agent-trace.js && node --check ./src/cc-loader.cjs"
+    "check": "node --check ./bin/agent-trace.js && node --check ./src/cc-loader.cjs",
+    "test": "npm run check && node ./test/smoke.mjs"
   },
   "repository": {
     "type": "git",

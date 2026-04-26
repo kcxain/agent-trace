@@ -172,6 +172,38 @@ The index is written to:
 .agent-trace/index.html
 ```
 
+## Validation and Training Export
+
+Validate that a trace has the expected files, readable Codex rollouts, reconstructed turns, token usage, tool calls, edit calls, and subagent links:
+
+```sh
+agent-trace --validate-trace .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
+```
+
+Export a structured JSONL dataset for downstream training or fine-tuning preprocessing:
+
+```sh
+agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
+```
+
+The export writes `training.jsonl`. Each row is one reconstructed turn and includes:
+
+- trace/session metadata, including subagent parent thread IDs
+- exact prompt messages sent to the agent, including system/developer/user messages when available
+- assistant text and structured assistant parts
+- tool calls, tool inputs, tool outputs, and whether the tool is an edit tool
+- per-turn and cumulative model token usage, including cached input tokens
+- timing fields such as turn duration and time to first token
+- captured API request/response events linked to the turn
+
+Training export redacts sensitive header-like fields by default, including `authorization`, cookies, API keys, and token fields. For a fully private, controlled dataset you can opt into the unredacted export:
+
+```sh
+agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS training.full.jsonl --include-sensitive
+```
+
+Treat unredacted exports as secrets.
+
 ## Notes
 
 - Trace output can contain prompts, code, file contents, tool output, and model responses. Treat `.agent-trace/` as private.
