@@ -391,12 +391,12 @@ function isPromptRole(role) {
   return role === "system" || role === "developer" || role === "user";
 }
 
-function promptMessageFromResponseItem(line) {
+function promptMessageFromResponseItem(line, rolloutIndex = null) {
   const payload = line.payload || {};
   if (payload.type !== "message" || !isPromptRole(payload.role)) return null;
   const text = textFromContent(payload.content).trim();
   if (!text) return null;
-  return { role: payload.role, source: "response_item", timestamp: line.timestamp || "", text };
+  return { role: payload.role, source: "response_item.message", rollout_index: rolloutIndex, timestamp: line.timestamp || "", text };
 }
 
 function summarizeEvents(events) {
@@ -860,10 +860,10 @@ function buildTraceTurns(rollout, events) {
     current = null;
     if (clearPrompts) pendingPromptMessages = [];
   };
-  for (const line of rollout.lines || []) {
+  for (const [rolloutIndex, line] of (rollout.lines || []).entries()) {
     const payload = line.payload || {};
     if (line.type === "turn_context") pendingContext = payload;
-    const promptMessage = line.type === "response_item" ? promptMessageFromResponseItem(line) : null;
+    const promptMessage = line.type === "response_item" ? promptMessageFromResponseItem(line, rolloutIndex + 1) : null;
     if (promptMessage && !current) {
       pendingPromptMessages.push(promptMessage);
       continue;
@@ -876,7 +876,9 @@ function buildTraceTurns(rollout, events) {
       finish(false);
       current = newTurn({ started_at: line.timestamp || "", user: payload.message || "", context: pendingContext });
       pendingPromptMessages = [];
-      if (payload.message) current.promptMessages.push({ role: "user", source: "event_msg.user_message", timestamp: line.timestamp || "", text: payload.message });
+      if (payload.message && !current.promptMessages.some((message) => message.role === "user" && message.text === payload.message)) {
+        current.promptMessages.push({ role: "user", source: "event_msg.user_message", rollout_index: rolloutIndex + 1, timestamp: line.timestamp || "", text: payload.message, audit_only: true });
+      }
     } else if (!current && line.type === "event_msg") {
       current = newTurn({ started_at: line.timestamp || "", context: pendingContext });
     }
@@ -885,7 +887,7 @@ function buildTraceTurns(rollout, events) {
       current.promptMessages.push(promptMessage);
       if (promptMessage.role === "user" && !current.user && !promptMessage.text.startsWith("<environment_context>") && !promptMessage.text.startsWith("<subagent_notification>")) current.user = promptMessage.text;
     } else if (line.type === "event_msg" && payload.type === "agent_message") {
-      if (payload.message) current.assistantParts.push({ type: "text", text: payload.message, phase: payload.phase, timestamp: line.timestamp });
+      if (payload.message) current.assistantParts.push({ type: "text", text: payload.message, phase: payload.phase, timestamp: line.timestamp, rollout_index: rolloutIndex + 1 });
     } else if (line.type === "event_msg" && payload.type === "token_count") {
       current.usage = payload.info?.last_token_usage || payload.info?.total_token_usage || current.usage;
       current.total_usage = payload.info?.total_token_usage || current.total_usage;
@@ -897,17 +899,17 @@ function buildTraceTurns(rollout, events) {
       current.time_to_first_token_ms = payload.time_to_first_token_ms ?? null;
       finish();
     } else if (line.type === "response_item" && payload.type === "function_call") {
-      const call = { id: payload.call_id || "", name: payload.name || "function_call", input: parseJsonMaybe(payload.arguments), timestamp: line.timestamp };
+      const call = { id: payload.call_id || "", name: payload.name || "function_call", input: parseJsonMaybe(payload.arguments), timestamp: line.timestamp, rollout_index: rolloutIndex + 1 };
       current.toolCalls.push(call);
       current.assistantParts.push({ type: "tool", call });
     } else if (line.type === "response_item" && payload.type === "function_call_output") {
-      current.toolOutputs.set(payload.call_id || "", { content: normalizeToolOutput(payload.output), timestamp: line.timestamp });
+      current.toolOutputs.set(payload.call_id || "", { content: normalizeToolOutput(payload.output), timestamp: line.timestamp, rollout_index: rolloutIndex + 1 });
     } else if (line.type === "response_item" && payload.type === "custom_tool_call") {
-      const call = { id: payload.call_id || "", name: payload.name || "custom_tool_call", input: customToolInput(payload.name, payload.input), timestamp: line.timestamp, status: payload.status || "" };
+      const call = { id: payload.call_id || "", name: payload.name || "custom_tool_call", input: customToolInput(payload.name, payload.input), timestamp: line.timestamp, status: payload.status || "", rollout_index: rolloutIndex + 1 };
       current.toolCalls.push(call);
       current.assistantParts.push({ type: "tool", call });
     } else if (line.type === "response_item" && payload.type === "custom_tool_call_output") {
-      current.toolOutputs.set(payload.call_id || "", { content: normalizeCustomToolOutput(payload.output), timestamp: line.timestamp });
+      current.toolOutputs.set(payload.call_id || "", { content: normalizeCustomToolOutput(payload.output), timestamp: line.timestamp, rollout_index: rolloutIndex + 1 });
     }
   }
   finish();
@@ -1449,13 +1451,26 @@ function compactApiEvent(event, index, includeSensitive = false) {
 
 function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, events, includeSensitive }) {
   const meta = sessionMetaFromRollout(rollout);
+  const rawModelEvents = (events || []).filter((event) => {
+    const url = requestEventUrl(event);
+    return /\/v1\/(responses|chat\/completions)\b/.test(url);
+  });
   const promptMessages = [];
   if (meta.base_instructions?.text) promptMessages.push({ role: "system", source: "session_meta.base_instructions", timestamp: meta.timestamp || "", content: meta.base_instructions.text });
-  for (const message of turn.promptMessages || []) {
-    promptMessages.push({ role: message.role || "unknown", source: message.source || "", timestamp: message.timestamp || "", content: message.text || "" });
+  const modelPromptMessages = (turn.promptMessages || []).filter((message) => !message.audit_only);
+  const promptSource = modelPromptMessages.length ? modelPromptMessages : (turn.promptMessages || []);
+  for (const message of promptSource) {
+    promptMessages.push({
+      role: message.role || "unknown",
+      source: message.source || "",
+      rollout_index: message.rollout_index ?? null,
+      timestamp: message.timestamp || "",
+      content: message.text || "",
+      is_model_input: !message.audit_only,
+    });
   }
   if (turn.context?.collaboration_mode?.settings?.developer_instructions) {
-    promptMessages.push({ role: "developer", source: "turn_context.developer_instructions", timestamp: turn.started_at || "", content: turn.context.collaboration_mode.settings.developer_instructions });
+    promptMessages.push({ role: "developer", source: "turn_context.developer_instructions", rollout_index: null, timestamp: turn.started_at || "", content: turn.context.collaboration_mode.settings.developer_instructions, is_model_input: false });
   }
   const assistantText = turn.assistantParts.filter((part) => part.type === "text" && part.text).map((part) => part.text).join("\n\n");
   const toolCalls = (turn.toolCalls || []).map((call) => {
@@ -1464,10 +1479,12 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
       id: call.id || "",
       name: call.name || "",
       timestamp: call.timestamp || "",
+      rollout_index: call.rollout_index ?? null,
       status: call.status || "",
       input: includeSensitive ? call.input : redactSensitive(call.input),
       output: output?.content ? stripAnsi(output.content) : "",
       output_timestamp: output?.timestamp || "",
+      output_rollout_index: output?.rollout_index ?? null,
       is_edit: isEditTool(call.name),
     };
   });
@@ -1482,6 +1499,13 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
       started_at: runMeta.started_at || "",
       finished_at: runMeta.finished_at || "",
       auth_mode: runMeta.auth_mode || "",
+      provenance: {
+        prompt_source: "codex_rollout.response_item.message plus session_meta.base_instructions",
+        output_source: "codex_rollout.event_msg.agent_message and response_item tool events",
+        api_source: "agent-trace local forwarding proxy logs",
+        raw_model_http_events: rawModelEvents.length,
+        raw_model_http_request_captured: rawModelEvents.length > 0,
+      },
     },
     session: {
       id: meta.id || "",
@@ -1510,7 +1534,7 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
     prompt_messages: promptMessages,
     assistant: {
       text: assistantText,
-      parts: turn.assistantParts.map((part) => part.type === "tool" ? { type: "tool", call_id: part.call?.id || "", name: part.call?.name || "" } : part),
+      parts: turn.assistantParts.map((part) => part.type === "tool" ? { type: "tool", call_id: part.call?.id || "", name: part.call?.name || "", rollout_index: part.call?.rollout_index ?? null } : part),
     },
     tool_calls: toolCalls,
     raw_turn_context: includeSensitive ? turn.context || null : redactSensitive(turn.context || null),
@@ -1555,6 +1579,7 @@ function validateTrace(runDir) {
   let turnsWithUsage = 0;
   let turnsWithPrompt = 0;
   let subagentCount = 0;
+  let orderingIssues = 0;
   for (const rollout of loaded.rollouts) {
     if (isSubagentRollout(rollout)) subagentCount += 1;
     const turns = buildTraceTurns(rollout, isSubagentRollout(rollout) ? [] : loaded.events);
@@ -1564,8 +1589,20 @@ function validateTrace(runDir) {
       if ((turn.promptMessages || []).length || turn.user) turnsWithPrompt += 1;
       toolCount += turn.toolCalls.length;
       editToolCount += turn.toolCalls.filter((call) => isEditTool(call.name)).length;
+      const orderedParts = turn.assistantParts.map((part) => part.type === "tool" ? part.call?.rollout_index : part.rollout_index).filter((index) => index != null);
+      for (let i = 1; i < orderedParts.length; i++) {
+        if (orderedParts[i] < orderedParts[i - 1]) {
+          orderingIssues += 1;
+          warnings.push(`assistant part order decreased in turn ${turn.turn_id || turnCount}: ${orderedParts[i - 1]} -> ${orderedParts[i]}`);
+        }
+      }
       for (const call of turn.toolCalls) {
         if (call.id && !turn.toolOutputs.has(call.id)) warnings.push(`tool call has no output: ${call.name} ${call.id}`);
+        const output = turn.toolOutputs.get(call.id);
+        if (output?.rollout_index != null && call.rollout_index != null && output.rollout_index < call.rollout_index) {
+          orderingIssues += 1;
+          warnings.push(`tool output appears before call: ${call.name} ${call.id}`);
+        }
       }
     }
   }
@@ -1588,6 +1625,7 @@ function validateTrace(runDir) {
       turns_with_prompt_messages: turnsWithPrompt,
       tool_calls: toolCount,
       edit_tool_calls: editToolCount,
+      ordering_issues: orderingIssues,
     },
     errors,
     warnings,

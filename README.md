@@ -195,6 +195,7 @@ The export writes `training.jsonl`. Each row is one reconstructed turn and inclu
 - per-turn and cumulative model token usage, including cached input tokens
 - timing fields such as turn duration and time to first token
 - captured API request/response events linked to the turn
+- `rollout_index` fields that point back to the exact Codex rollout JSONL line order
 
 Training export redacts sensitive header-like fields by default, including `authorization`, cookies, API keys, and token fields. For a fully private, controlled dataset you can opt into the unredacted export:
 
@@ -203,6 +204,8 @@ agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS train
 ```
 
 Treat unredacted exports as secrets.
+
+For Codex login-mode sessions, `agent-trace` treats Codex rollout `response_item.message` entries as the authoritative recorded model input and rollout `agent_message` / tool events as the authoritative recorded output stream. The local proxy still captures HTTP requests it can see, but the raw model HTTP payload is only marked as captured when `/v1/responses` or `/v1/chat/completions` traffic is actually present. Check `trace.provenance.raw_model_http_request_captured` in `training.jsonl`.
 
 ## Notes
 
