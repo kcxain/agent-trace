@@ -1,0 +1,33 @@
+{
+  "name": "agent-trace",
+  "version": "0.1.0",
+  "description": "Trace Claude Code and Codex CLI sessions and render local HTML/Markdown reports.",
+  "type": "module",
+  "bin": {
+    "agent-trace": "./bin/agent-trace.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "trace": "node ./bin/agent-trace.js",
+    "check": "node --check ./bin/agent-trace.js && node --check ./src/cc-loader.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kcxain/agent-trace.git"
+  },
+  "keywords": [
+    "agent",
+    "trace",
+    "claude-code",
+    "codex",
+    "debugging"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

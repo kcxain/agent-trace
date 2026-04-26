@@ -1,0 +1,5 @@
+.agent-trace/
+.codex-trace/
+node_modules/
+npm-debug.log*
+.DS_Store
