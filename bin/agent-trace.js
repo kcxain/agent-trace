@@ -1546,8 +1546,8 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
       finished_at: runMeta.finished_at || "",
       auth_mode: runMeta.auth_mode || "",
       provenance: {
-        prompt_source: rawModelRequestBodyEvents.length ? "agent-trace proxy /v1/responses request body" : "codex_rollout.response_item.message plus session_meta.base_instructions",
-        output_source: rawModelSuccessEvents.length ? "agent-trace proxy /v1/responses response body or websocket frames" : "codex_rollout.event_msg.agent_message and response_item tool events",
+        prompt_source: rawModelRequestBodyEvents.length ? "agent-trace proxy captured Responses request body" : "codex_rollout.response_item.message plus session_meta.base_instructions",
+        output_source: rawModelSuccessEvents.length ? "agent-trace proxy captured Responses response body or websocket frames" : "codex_rollout.event_msg.agent_message and response_item tool events",
         api_source: "agent-trace local forwarding proxy logs",
         raw_model_http_events: rawModelEvents.length,
         raw_model_http_request_captured: rawModelEvents.length > 0,
@@ -1572,6 +1572,10 @@ function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, even
       completed_at: turn.completed_at || "",
       duration_ms: turn.duration_ms,
       time_to_first_token_ms: turn.time_to_first_token_ms,
+      token_usage: turn.usage || null,
+      total_token_usage: turn.total_usage || null,
+      model_context_window: turn.model_context_window || null,
+      rate_limits: turn.rate_limits || null,
     },
     token_usage: {
       last_turn: turn.usage || null,
