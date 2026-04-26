@@ -112,13 +112,13 @@ Override proxy URLs when Codex changes provider paths:
 agent-trace codex --base-url http://127.0.0.1:5055 --upstream-url https://chatgpt.com/backend-api/codex
 ```
 
-Experimental: also proxy `openai_base_url` to try to capture the main Responses API WebSocket:
+Capture Codex login-mode model traffic with a local HTTPS CONNECT MITM proxy:
 
 ```sh
 agent-trace codex --capture-model-requests --extract-token
 ```
 
-For ChatGPT-login Codex sessions this may fail if the login token is not accepted by the public Responses API endpoint. The default Codex mode keeps the session working and visualizes the Codex rollout JSONL, including model messages and token usage.
+For ChatGPT-login Codex sessions this keeps Codex on its normal `chatgpt.com/backend-api/codex/responses` websocket path and injects a per-run local CA through `CODEX_CA_CERTIFICATE`. The captured websocket frames keep exact `body_base64` bytes and, when possible, decoded JSON bodies such as `response.create`.
 
 ## Reports
 
@@ -206,11 +206,11 @@ agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS train
 
 Treat unredacted exports as secrets.
 
-For Codex login-mode sessions, use `--capture-model-requests` when you need wire-level model payloads. When capture succeeds, `training.jsonl` sets `trace.provenance.prompt_source` to the proxy-captured `/v1/responses` request body and stores the decoded request in `raw_model_requests`. If the login token is rejected by the OpenAI Responses API, request bodies can still be captured, but successful model responses will be absent; check `trace.provenance.raw_model_http_success_events`.
+For Codex login-mode sessions, use `--capture-model-requests` when you need wire-level model payloads. When capture succeeds, `training.jsonl` sets `trace.provenance.prompt_source` to the proxy-captured Responses request body and stores the decoded `response.create` websocket frame in `raw_model_requests`. Each websocket frame also keeps `body_base64` and SHA-256 fields so training pipelines can reprocess the exact bytes.
 
 ## Notes
 
 - Trace output can contain prompts, code, file contents, tool output, and model responses. Treat `.agent-trace/` as private.
 - Claude Code tracing uses a local Anthropic-compatible forwarding proxy and sets `ANTHROPIC_BASE_URL` for the launched process. `CLAUDE_TRACE_API_ENDPOINT` or `--upstream-url` can point that proxy at another Anthropic-compatible upstream.
-- Codex tracing works for logged-in use by routing `chatgpt_base_url` through a local loopback proxy. The main model request is also represented via Codex's rollout JSONL. Full raw main Responses API proxying is experimental because login-mode Codex may use credentials that are not accepted by the public API endpoint when `openai_base_url` is overridden.
+- Codex tracing works for logged-in use. Default mode routes `chatgpt_base_url` through a local loopback proxy for backend requests and uses Codex rollout JSONL for model messages. `--capture-model-requests` additionally starts a local HTTPS CONNECT MITM proxy for the login-mode websocket model path and does not override `openai_base_url`.
 - `--extract-token` writes sensitive headers to `tokens.jsonl` and renders them in `report.html` and `report.md`. Use it only in a private terminal and do not publish trace artifacts.

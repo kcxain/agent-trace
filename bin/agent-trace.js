@@ -9,11 +9,23 @@ import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_TRACE_DIR = ".agent-trace";
+
+function relaunchWithNodeEnvProxyIfNeeded() {
+  const hasProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy;
+  if (!hasProxy || process.env.NODE_USE_ENV_PROXY === "1" || process.env.AGENT_TRACE_NODE_ENV_PROXY_REEXEC === "1") return false;
+  const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    cwd: process.cwd(),
+    stdio: "inherit",
+    env: { ...process.env, NODE_USE_ENV_PROXY: "1", AGENT_TRACE_NODE_ENV_PROXY_REEXEC: "1" },
+  });
+  if (result.error) throw result.error;
+  process.exit(result.status ?? 1);
+}
 
 function usage() {
   console.log(`agent-trace
@@ -49,7 +61,7 @@ Codex options:
   --codex-bin <path>                     Codex binary (default: codex)
   --auth <mode>                          auto, api-key, or chatgpt-login (default: auto)
   --base-url <url>                       Override URL passed to Codex config
-  --capture-model-requests               Also proxy openai_base_url; experimental for login mode
+  --capture-model-requests               Capture Codex model traffic; login mode uses a local HTTPS MITM proxy
 
 Examples:
   agent-trace cc
@@ -931,7 +943,8 @@ function buildTraceTurns(rollout, events) {
     turn.api_events = (events || []).map((event, index) => ({ ...event, _traceIndex: index + 1 })).filter((event) => {
       const ms = parseIso(event.timestamp || event.request?.timestamp || event.response?.timestamp);
       if (ms == null || start == null) return false;
-      return ms >= start && (end == null || ms <= end);
+      const modelCaptureLeadMs = isRawModelHttpEvent(event) ? 5000 : 0;
+      return ms >= start - modelCaptureLeadMs && (end == null || ms <= end);
     });
     return turn;
   });
@@ -1115,7 +1128,7 @@ function renderTurnRequestTable(events) {
     event,
     index: event._traceIndex,
     anchor: event._traceIndex ? `request-log-${event._traceIndex}` : "",
-    label: event.request?.url || event.type || `event ${event._traceIndex || ""}`,
+    label: event.request?.url || event.url || event.type || `event ${event._traceIndex || ""}`,
   })));
 }
 
@@ -1168,7 +1181,7 @@ function renderCapturedRequestLog(events, rawDumps, runDir) {
   lines.push(`Captured \`${events.length}\` normalized log events from \`logs.jsonl\`.`);
   lines.push(`Captured \`${rawDumps.length}\` raw dump files from \`raw/*.json\`.`, "");
   if (events.length) {
-    const items = events.map((event, index) => ({ event, index: index + 1, anchor: `request-log-${index + 1}`, label: event.request?.url || event.type || `event ${index + 1}` }));
+    const items = events.map((event, index) => ({ event, index: index + 1, anchor: `request-log-${index + 1}`, label: event.request?.url || event.url || event.type || `event ${index + 1}` }));
     lines.push("### Request Overview", "", renderRequestOverviewTable(items), "");
     lines.push("### Normalized Events (`logs.jsonl`)", "");
     events.forEach((event, index) => {
@@ -1447,26 +1460,41 @@ function compactApiEvent(event, index, includeSensitive = false) {
     duration_ms: source.duration_ms ?? null,
     request: source.request || null,
     response: source.response || null,
+    direction: source.direction || null,
+    opcode: source.opcode ?? null,
+    body: source.body ?? null,
+    body_base64: source.body_base64 || null,
+    body_encoding: source.body_encoding || null,
+    body_sha256: source.body_sha256 || null,
+    body_decoded_sha256: source.body_decoded_sha256 || null,
     error: source.error || null,
   };
 }
 
 function isRawModelHttpEvent(event) {
-  return /\/v1\/(responses|chat\/completions)\b/.test(requestEventUrl(event));
+  return /\/v1\/(responses|chat\/completions)\b/.test(requestEventUrl(event)) || /\/backend-api\/codex\/responses\b/.test(requestEventUrl(event));
 }
 
 function hasCapturedRequestBody(event) {
-  return event?.request?.body != null || Boolean(event?.request?.body_base64);
+  return event?.request?.body != null || Boolean(event?.request?.body_base64) || event?.body != null || Boolean(event?.body_base64);
+}
+
+function isRawModelRequestEvent(event) {
+  if (event?.type === "websocket_frame") return event.direction === "client_to_upstream" && event.body?.type === "response.create";
+  return hasCapturedRequestBody(event);
+}
+
+function isRawModelSuccessEvent(event) {
+  if (event?.type === "websocket_frame") return event.direction === "upstream_to_client" && (event.body != null || Boolean(event.body_base64));
+  const status = Number(requestEventStatus(event));
+  return status >= 200 && status < 300;
 }
 
 function trainingRecordForTurn({ runDir, runMeta, rollout, turn, turnIndex, events, includeSensitive }) {
   const meta = sessionMetaFromRollout(rollout);
   const rawModelEvents = (turn.api_events || []).filter(isRawModelHttpEvent);
-  const rawModelRequestBodyEvents = rawModelEvents.filter(hasCapturedRequestBody);
-  const rawModelSuccessEvents = rawModelEvents.filter((event) => {
-    const status = Number(requestEventStatus(event));
-    return status >= 200 && status < 300;
-  });
+  const rawModelRequestBodyEvents = rawModelEvents.filter(isRawModelRequestEvent);
+  const rawModelSuccessEvents = rawModelEvents.filter(isRawModelSuccessEvent);
   const promptMessages = [];
   if (meta.base_instructions?.text) promptMessages.push({ role: "system", source: "session_meta.base_instructions", timestamp: meta.timestamp || "", content: meta.base_instructions.text });
   const modelPromptMessages = (turn.promptMessages || []).filter((message) => !message.audit_only);
@@ -1589,11 +1617,8 @@ function validateTrace(runDir) {
   }
   if (loaded.rawDumps.length && loaded.events.length && loaded.rawDumps.length !== loaded.events.length) warnings.push(`raw dump count (${loaded.rawDumps.length}) differs from normalized event count (${loaded.events.length})`);
   const rawModelEvents = loaded.events.filter(isRawModelHttpEvent);
-  const rawModelRequestBodyEvents = rawModelEvents.filter(hasCapturedRequestBody);
-  const rawModelSuccessEvents = rawModelEvents.filter((event) => {
-    const status = Number(requestEventStatus(event));
-    return status >= 200 && status < 300;
-  });
+  const rawModelRequestBodyEvents = rawModelEvents.filter(isRawModelRequestEvent);
+  const rawModelSuccessEvents = rawModelEvents.filter(isRawModelSuccessEvent);
   if (rawModelEvents.length && !rawModelSuccessEvents.length) warnings.push("raw model HTTP requests were captured, but no successful model response was captured");
 
   let turnCount = 0;
@@ -2012,7 +2037,28 @@ function parseWebSocketFrames() {
   };
 }
 
-function logWebSocketFrames(logFile, direction) {
+function decodeWebSocketPayload(payload) {
+  const attempts = [
+    ["identity", (value) => value],
+    ["deflate-raw", (value) => zlib.inflateRawSync(value, { finishFlush: zlib.constants.Z_SYNC_FLUSH })],
+    ["deflate", (value) => zlib.inflateSync(value, { finishFlush: zlib.constants.Z_SYNC_FLUSH })],
+    ["gzip", (value) => zlib.gunzipSync(value)],
+    ["br", (value) => zlib.brotliDecompressSync(value)],
+  ];
+  if (typeof zlib.zstdDecompressSync === "function") attempts.push(["zstd", (value) => zlib.zstdDecompressSync(value)]);
+  for (const [encoding, decode] of attempts) {
+    try {
+      const buffer = decode(payload);
+      const text = buffer.toString("utf8");
+      if (text && !text.includes("\ufffd")) return { encoding, buffer, text, parsed: parseMaybeJson(text) };
+    } catch {
+      // Try the next websocket payload encoding.
+    }
+  }
+  return null;
+}
+
+function logWebSocketFrames(logFile, direction, meta = {}) {
   const parser = parseWebSocketFrames();
   let handshakeDone = direction === "client_to_upstream";
   let pending = Buffer.alloc(0);
@@ -2028,9 +2074,21 @@ function logWebSocketFrames(logFile, direction) {
       if (!data.length) return;
     }
     for (const frame of parser(data)) {
-      const event = { type: "websocket_frame", timestamp: new Date().toISOString(), direction, opcode: frame.opcode };
-      if (frame.opcode === 1) event.body = parseMaybeJson(frame.payload.toString("utf8"));
-      else event.body_base64 = frame.payload.toString("base64");
+      const event = { type: "websocket_frame", timestamp: new Date().toISOString(), direction, opcode: frame.opcode, ...meta };
+      if (frame.payload.length) {
+        event.body_base64 = frame.payload.toString("base64");
+        event.body_sha256 = crypto.createHash("sha256").update(frame.payload).digest("hex");
+      }
+      if (frame.opcode === 1) {
+        const decoded = decodeWebSocketPayload(frame.payload);
+        if (decoded) {
+          event.body = decoded.parsed;
+          event.body_encoding = decoded.encoding;
+          if (decoded.encoding !== "identity") {
+            event.body_decoded_sha256 = crypto.createHash("sha256").update(decoded.buffer).digest("hex");
+          }
+        }
+      }
       writeJsonl(logFile, event);
     }
   };
@@ -2079,6 +2137,203 @@ function connectTls(target, onConnect, onError) {
     tlsSocket.on("error", onError);
   });
   return proxySocket;
+}
+
+function connectRawTarget(host, port, onConnect, onError) {
+  const proxy = proxyUrlFor({ hostname: host });
+  if (!proxy) {
+    const socket = net.connect(Number(port), host, () => onConnect(socket));
+    socket.on("error", onError);
+    return socket;
+  }
+
+  const proxyTarget = new URL(proxy);
+  const proxySocket = net.connect(Number(proxyTarget.port || 80), proxyTarget.hostname);
+  proxySocket.on("error", onError);
+  proxySocket.once("connect", () => {
+    proxySocket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
+  });
+  let response = Buffer.alloc(0);
+  proxySocket.on("data", function onProxyData(chunk) {
+    response = Buffer.concat([response, chunk]);
+    const marker = response.indexOf("\r\n\r\n");
+    if (marker === -1) return;
+    proxySocket.off("data", onProxyData);
+    const head = response.subarray(0, marker).toString("utf8");
+    const rest = response.subarray(marker + 4);
+    if (!/^HTTP\/1\.[01] 200\b/.test(head)) {
+      onError(new Error(`proxy CONNECT failed: ${head.split("\r\n")[0]}`));
+      proxySocket.destroy();
+      return;
+    }
+    if (rest.length) proxySocket.unshift(rest);
+    onConnect(proxySocket);
+  });
+  return proxySocket;
+}
+
+function ensureCodexMitmCerts(runDir) {
+  const certDir = path.join(runDir, "mitm");
+  mkdirp(certDir);
+  const caKey = path.join(certDir, "agent-trace-ca.key");
+  const caPem = path.join(certDir, "agent-trace-ca.pem");
+  const hostKey = path.join(certDir, "chatgpt.com.key");
+  const hostCsr = path.join(certDir, "chatgpt.com.csr");
+  const hostPem = path.join(certDir, "chatgpt.com.pem");
+  const hostConf = path.join(certDir, "chatgpt.com.cnf");
+  if (!fs.existsSync(caPem)) {
+    execFileSync("openssl", ["genrsa", "-out", caKey, "2048"], { stdio: "ignore" });
+    execFileSync("openssl", ["req", "-x509", "-new", "-nodes", "-key", caKey, "-sha256", "-days", "30", "-subj", "/CN=agent-trace local CA", "-out", caPem], { stdio: "ignore" });
+  }
+  if (!fs.existsSync(hostPem)) {
+    fs.writeFileSync(hostConf, [
+      "[req]",
+      "distinguished_name=req_distinguished_name",
+      "req_extensions=v3_req",
+      "prompt=no",
+      "[req_distinguished_name]",
+      "CN=chatgpt.com",
+      "[v3_req]",
+      "subjectAltName=@alt_names",
+      "[alt_names]",
+      "DNS.1=chatgpt.com",
+      "DNS.2=*.chatgpt.com",
+      "",
+    ].join("\n"));
+    execFileSync("openssl", ["genrsa", "-out", hostKey, "2048"], { stdio: "ignore" });
+    execFileSync("openssl", ["req", "-new", "-key", hostKey, "-out", hostCsr, "-config", hostConf], { stdio: "ignore" });
+    execFileSync("openssl", ["x509", "-req", "-in", hostCsr, "-CA", caPem, "-CAkey", caKey, "-CAcreateserial", "-out", hostPem, "-days", "30", "-sha256", "-extfile", hostConf, "-extensions", "v3_req"], { stdio: "ignore" });
+  }
+  return { caPem, key: fs.readFileSync(hostKey), cert: fs.readFileSync(hostPem) };
+}
+
+function parseHttpHead(buffer) {
+  const marker = buffer.indexOf("\r\n\r\n");
+  if (marker === -1) return null;
+  const head = buffer.subarray(0, marker).toString("utf8");
+  const rest = buffer.subarray(marker + 4);
+  const lines = head.split("\r\n");
+  const [method, target, version] = lines.shift().split(" ");
+  const headers = {};
+  for (const line of lines) {
+    const index = line.indexOf(":");
+    if (index === -1) continue;
+    const key = line.slice(0, index).toLowerCase();
+    const value = line.slice(index + 1).trim();
+    if (headers[key]) headers[key] = `${headers[key]}, ${value}`;
+    else headers[key] = value;
+  }
+  return { method, target, version, headers, rawHead: head, rest };
+}
+
+function startCodexMitmProxy({ port, runDir, logFile, tokenFile, extractToken, certs }) {
+  let counter = 0;
+  const rawDir = path.join(runDir, "raw");
+  mkdirp(rawDir);
+  const secureContext = tls.createSecureContext({ key: certs.key, cert: certs.cert });
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    if (req.url === "/shutdown") {
+      res.writeHead(200).end("ok");
+      for (const socket of sockets) socket.destroy();
+      server.close();
+      return;
+    }
+    res.writeHead(501).end("agent-trace MITM proxy only supports CONNECT");
+  });
+  server.on("connect", (req, clientSocket, head) => {
+    sockets.add(clientSocket);
+    clientSocket.on("close", () => sockets.delete(clientSocket));
+    const [host, portText = "443"] = String(req.url || "").split(":");
+    const targetPort = Number(portText || 443);
+    if (host !== "chatgpt.com" || targetPort !== 443) {
+      connectRawTarget(host, targetPort, (upstream) => {
+        sockets.add(upstream);
+        upstream.on("close", () => sockets.delete(upstream));
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+      }, (error) => clientSocket.destroy(error));
+      return;
+    }
+
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext, ALPNProtocols: ["http/1.1"] });
+    let initial = Buffer.alloc(0);
+    tlsSocket.on("data", function onInitialData(chunk) {
+      initial = Buffer.concat([initial, chunk]);
+      const parsed = parseHttpHead(initial);
+      if (!parsed) return;
+      tlsSocket.off("data", onInitialData);
+      const id = `${String(++counter).padStart(4, "0")}-${Date.now()}`;
+      const started = Date.now();
+      const target = new URL(parsed.target, "https://chatgpt.com");
+      const requestRecord = { timestamp: new Date(started).toISOString(), method: parsed.method, url: target.toString(), headers: sanitizeHeaders(parsed.headers), mitm: true };
+      if (extractToken) {
+        for (const token of extractTokenHeaders(parsed.headers)) {
+          writeTokenFile(tokenFile, { timestamp: new Date(started).toISOString(), url: target.toString(), header: token.header, preview: tokenPreview(token.value), value: token.value });
+        }
+      }
+      connectTls(target, (upstream) => {
+        sockets.add(upstream);
+        upstream.on("close", () => sockets.delete(upstream));
+        const upstreamHead = parsed.rawHead
+          .replace(/^Host: .*$/im, "Host: chatgpt.com")
+          .replace(/^Sec-WebSocket-Extensions:.*\r?\n/im, "");
+        upstream.write(`${upstreamHead}\r\n\r\n`);
+        if (parsed.rest.length) upstream.write(parsed.rest);
+        const isWebSocket = /websocket/i.test(parsed.headers.upgrade || "") || /\/backend-api\/codex\/responses\b/.test(target.pathname);
+        let wroteClose = false;
+        const close = (error) => {
+          if (wroteClose) return;
+          wroteClose = true;
+          const event = { type: isWebSocket ? "websocket_connection" : "mitm_connection", request: requestRecord, duration_ms: Date.now() - started };
+          if (error) event.error = String(error);
+          try {
+            fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(event, null, 2));
+            writeJsonl(logFile, event);
+          } catch {
+            // Best effort; process shutdown can close files underneath us.
+          }
+        };
+        if (isWebSocket) {
+          const frameMeta = { url: target.toString(), websocket: true };
+          const clientLogger = logWebSocketFrames(logFile, "client_to_upstream", frameMeta);
+          const upstreamLogger = logWebSocketFrames(logFile, "upstream_to_client", frameMeta);
+          if (parsed.rest.length) clientLogger(parsed.rest);
+          tlsSocket.on("data", (data) => {
+            clientLogger(data);
+            upstream.write(data);
+          });
+          upstream.on("data", (data) => {
+            upstreamLogger(data);
+            tlsSocket.write(data);
+          });
+        } else {
+          tlsSocket.pipe(upstream);
+          upstream.pipe(tlsSocket);
+        }
+        upstream.on("error", close);
+        tlsSocket.on("error", close);
+        upstream.on("close", () => close());
+        tlsSocket.on("close", () => close());
+      }, (error) => tlsSocket.destroy(error));
+    });
+    tlsSocket.on("error", () => clientSocket.destroy());
+  });
+  return new Promise((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(port ? Number(port) : 0, "127.0.0.1", () => resolve({
+      server,
+      port: server.address().port,
+      caPem: certs.caPem,
+      destroy: () => {
+        for (const socket of sockets) socket.destroy();
+        server.close();
+      },
+    }));
+  });
 }
 
 function startForwardProxy({ port, upstreamUrl, openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken }) {
@@ -2179,11 +2434,12 @@ function startForwardProxy({ port, upstreamUrl, openaiUpstreamUrl, runDir, logFi
 }
 
 async function shutdownProxy(port) {
-  try {
-    await fetch(`http://127.0.0.1:${port}/shutdown`);
-  } catch {
-    // The server may close before the response is read.
-  }
+  await new Promise((resolve) => {
+    const socket = net.connect(Number(port), "127.0.0.1", () => socket.end("GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"));
+    socket.on("error", resolve);
+    socket.on("close", resolve);
+    socket.setTimeout(1000, () => socket.destroy());
+  });
 }
 
 function findRecentCodexRollouts(startMs) {
@@ -2229,18 +2485,23 @@ async function runCodex(opts) {
   const logFile = path.join(runDir, "logs.jsonl");
   const tokenFile = path.join(runDir, "tokens.jsonl");
   const auth = resolveCodexAuth(opts);
-  const proxy = await startForwardProxy({ port: opts.port, upstreamUrl: auth.upstreamUrl, openaiUpstreamUrl: auth.openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken: opts.extractToken });
+  const useLoginMitm = auth.mode === "chatgpt-login" && opts.captureModelRequests;
+  const proxy = useLoginMitm
+    ? await startCodexMitmProxy({ port: opts.port, runDir, logFile, tokenFile, extractToken: opts.extractToken, certs: ensureCodexMitmCerts(runDir) })
+    : await startForwardProxy({ port: opts.port, upstreamUrl: auth.upstreamUrl, openaiUpstreamUrl: auth.openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken: opts.extractToken });
   const baseUrl = opts.baseUrl || (auth.mode === "api-key" ? `http://127.0.0.1:${proxy.port}/v1` : `http://127.0.0.1:${proxy.port}`);
-  const args = auth.mode === "chatgpt-login" && opts.captureModelRequests
-    ? ["-c", `chatgpt_base_url="${baseUrl}"`, "-c", `openai_base_url="${baseUrl}/v1"`, ...opts.agentArgs]
-    : ["-c", `${auth.configKey}="${baseUrl}"`, ...opts.agentArgs];
-  writeJson(path.join(runDir, "codex-command.json"), { command: opts.codexBin, args, auth_mode: auth.mode });
-  console.log(`agent-trace: proxy listening on ${proxy.port}`);
+  const args = useLoginMitm ? [...opts.agentArgs] : ["-c", `${auth.configKey}="${baseUrl}"`, ...opts.agentArgs];
+  const env = useLoginMitm
+    ? { ...process.env, HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}`, https_proxy: `http://127.0.0.1:${proxy.port}`, http_proxy: `http://127.0.0.1:${proxy.port}`, all_proxy: `http://127.0.0.1:${proxy.port}`, CODEX_CA_CERTIFICATE: proxy.caPem }
+    : process.env;
+  writeJson(path.join(runDir, "codex-command.json"), { command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy" });
+  console.log(`agent-trace: proxy listening on ${proxy.port}${useLoginMitm ? " (Codex HTTPS MITM)" : ""}`);
   console.log(`agent-trace: tracing Codex to ${runDir}`);
-  const child = spawn(opts.codexBin, args, { cwd: process.cwd(), stdio: "inherit", env: process.env });
+  const child = spawn(opts.codexBin, args, { cwd: process.cwd(), stdio: "inherit", env });
   const exit = await waitForExit(child);
-  await shutdownProxy(proxy.port);
-  const meta = { agent: "codex", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.codexBin, args, auth_mode: auth.mode, upstream_url: auth.upstreamUrl, openai_upstream_url: auth.openaiUpstreamUrl, base_url: baseUrl, exit, log_file: logFile, token_file: tokenFile, rollouts: findRecentCodexRollouts(startedMs) };
+  if (useLoginMitm && typeof proxy.destroy === "function") proxy.destroy();
+  else await shutdownProxy(proxy.port);
+  const meta = { agent: "codex", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy", upstream_url: auth.upstreamUrl, openai_upstream_url: auth.openaiUpstreamUrl, base_url: useLoginMitm ? null : baseUrl, mitm_ca: useLoginMitm ? proxy.caPem : null, exit, log_file: logFile, token_file: tokenFile, rollouts: findRecentCodexRollouts(startedMs) };
   writeJson(path.join(runDir, "run.json"), meta);
   const report = generateRunHtml(runDir);
   const markdown = generateRunMarkdown(runDir);
@@ -2291,6 +2552,8 @@ async function main() {
   if (opts.agent === "codex") return runCodex(opts);
   return runClaude(opts);
 }
+
+relaunchWithNodeEnvProxyIfNeeded();
 
 main().catch((error) => {
   console.error(`agent-trace: ${error.message}`);
