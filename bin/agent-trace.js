@@ -344,6 +344,31 @@ function normalizeToolOutput(output) {
   }
 }
 
+function normalizeCustomToolOutput(output) {
+  if (output == null) return "";
+  if (typeof output !== "string") return normalizeToolOutput(output);
+  const trimmed = output.trim();
+  if (!trimmed) return "";
+  try {
+    const data = JSON.parse(trimmed);
+    if (data && typeof data === "object") {
+      const rendered = String(data.output || "").trim();
+      const metadata = data.metadata && typeof data.metadata === "object" ? JSON.stringify(data.metadata, null, 2) : "";
+      if (rendered && metadata) return `${rendered}\n\n${metadata}`;
+      if (rendered) return rendered;
+      return JSON.stringify(data, null, 2);
+    }
+  } catch {
+    // Fall through to plain output.
+  }
+  return output;
+}
+
+function customToolInput(name, input) {
+  if (name === "apply_patch" && typeof input === "string") return { patch: input };
+  return parseJsonMaybe(input);
+}
+
 function isPromptRole(role) {
   return role === "system" || role === "developer" || role === "user";
 }
@@ -528,10 +553,65 @@ function renderMarkdownItem(item) {
 }
 
 function readRolloutsForRun(runMeta) {
-  return (runMeta.rollouts || []).map((item) => {
+  const rollouts = (runMeta.rollouts || []).map((item) => {
     const lines = readJsonl(item.file);
     return { ...item, lines, summary: summarizeEvents(lines) };
   });
+  return selectRelevantRollouts(rollouts, runMeta);
+}
+
+function selectRelevantRollouts(rollouts, runMeta = {}) {
+  if (rollouts.length <= 1) return rollouts;
+  const startedMs = parseIso(runMeta.started_at);
+  const windowStart = startedMs == null ? null : startedMs - 5000;
+  let roots = rollouts.filter((rollout) => {
+    if (isSubagentRollout(rollout)) return false;
+    const meta = sessionMetaFromRollout(rollout);
+    const timestampMs = parseIso(meta.timestamp);
+    return windowStart == null || timestampMs == null || timestampMs >= windowStart;
+  });
+  if (!roots.length) roots = rollouts.filter((rollout) => !isSubagentRollout(rollout)).slice(0, 1);
+
+  const included = [];
+  const ids = new Set();
+  const include = (rollout) => {
+    if (!rollout || included.includes(rollout)) return;
+    included.push(rollout);
+    const id = sessionMetaFromRollout(rollout).id;
+    if (id) ids.add(id);
+  };
+  roots.sort((a, b) => (parseIso(sessionMetaFromRollout(a).timestamp) || 0) - (parseIso(sessionMetaFromRollout(b).timestamp) || 0)).forEach(include);
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const rollout of rollouts) {
+      if (!isSubagentRollout(rollout)) continue;
+      if (!ids.has(parentThreadIdFromMeta(sessionMetaFromRollout(rollout)))) continue;
+      if (included.includes(rollout)) continue;
+      include(rollout);
+      changed = true;
+    }
+  }
+  return included.sort((a, b) => (parseIso(sessionMetaFromRollout(a).timestamp) || 0) - (parseIso(sessionMetaFromRollout(b).timestamp) || 0));
+}
+
+function readRolloutSessionMetaFile(file) {
+  try {
+    const lines = fs.readFileSync(file, "utf8").split("\n").slice(0, 200);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === "session_meta") return parsed.payload || {};
+      } catch {
+        // Keep scanning; malformed JSONL lines should not prevent trace rendering.
+      }
+    }
+  } catch {
+    // Missing or unreadable rollout files are ignored by discovery.
+  }
+  return {};
 }
 
 function sessionMetaFromRollout(rollout) {
@@ -541,6 +621,15 @@ function sessionMetaFromRollout(rollout) {
 function isSubagentRollout(rollout) {
   const source = sessionMetaFromRollout(rollout).source;
   return Boolean(source && typeof source === "object" && source.subagent);
+}
+
+function isSubagentMeta(meta) {
+  const source = meta?.source;
+  return Boolean(source && typeof source === "object" && source.subagent);
+}
+
+function parentThreadIdFromMeta(meta) {
+  return meta?.source?.subagent?.thread_spawn?.parent_thread_id || "";
 }
 
 function formatDurationSeconds(seconds) {
@@ -759,6 +848,12 @@ function buildTraceTurns(rollout, events) {
       current.assistantParts.push({ type: "tool", call });
     } else if (line.type === "response_item" && payload.type === "function_call_output") {
       current.toolOutputs.set(payload.call_id || "", { content: normalizeToolOutput(payload.output), timestamp: line.timestamp });
+    } else if (line.type === "response_item" && payload.type === "custom_tool_call") {
+      const call = { id: payload.call_id || "", name: payload.name || "custom_tool_call", input: customToolInput(payload.name, payload.input), timestamp: line.timestamp, status: payload.status || "" };
+      current.toolCalls.push(call);
+      current.assistantParts.push({ type: "tool", call });
+    } else if (line.type === "response_item" && payload.type === "custom_tool_call_output") {
+      current.toolOutputs.set(payload.call_id || "", { content: normalizeCustomToolOutput(payload.output), timestamp: line.timestamp });
     }
   }
   finish();
@@ -775,7 +870,7 @@ function buildTraceTurns(rollout, events) {
   return merged.map((turn) => {
     const start = parseIso(turn.started_at);
     const end = parseIso(turn.completed_at);
-    turn.api_events = (events || []).filter((event) => {
+    turn.api_events = (events || []).map((event, index) => ({ ...event, _traceIndex: index + 1 })).filter((event) => {
       const ms = parseIso(event.timestamp || event.request?.timestamp || event.response?.timestamp);
       if (ms == null || start == null) return false;
       return ms >= start && (end == null || ms <= end);
@@ -840,13 +935,39 @@ function renderTraceEnhancement(turn, sessionMeta) {
   body.push("", renderPromptMessagesForTurn(turn, sessionMeta));
   body.push("", "### Raw Turn Context", "", fence(JSON.stringify(turn.context || {}, null, 2), "json"));
   if (turn.api_events?.length) {
-    body.push("", "### Raw API Requests In This Turn", "");
-    turn.api_events.forEach((event, index) => {
-      const label = event.request?.url || event.type || `event ${index + 1}`;
-      body.push(detailsBlock(`Request ${index + 1}: ${requestEventMethod(event)} ${shortUrl(label)}`, renderRequestEventDetails(event, label)), "");
-    });
+    body.push("", "### API Requests Captured During This Turn", "");
+    body.push("Full request and response bodies are kept once in `Captured Request Log`; this turn links to those canonical entries.", "");
+    body.push(renderTurnRequestTable(turn.api_events));
   }
   return detailsBlock("Agent Trace Details", body.join("\n"));
+}
+
+function renderTraceSummary({ turns, subagents, events, rawDumps, tokens }) {
+  const toolCounts = new Map();
+  let editCalls = 0;
+  for (const turn of turns || []) {
+    for (const call of turn.toolCalls || []) {
+      toolCounts.set(call.name, (toolCounts.get(call.name) || 0) + 1);
+      if (isEditTool(call.name)) editCalls += 1;
+    }
+  }
+  const totalToolCalls = [...toolCounts.values()].reduce((sum, count) => sum + count, 0);
+  const lines = ["## Trace Summary", ""];
+  lines.push("| Metric | Count |", "| --- | ---: |");
+  lines.push(`| Conversation turns | ${turns.length} |`);
+  lines.push(`| Tool calls | ${totalToolCalls} |`);
+  lines.push(`| Code edit tool calls | ${editCalls} |`);
+  lines.push(`| Subagent conversations | ${subagents.length} |`);
+  lines.push(`| Normalized API events | ${events.length} |`);
+  lines.push(`| Raw request dump files | ${rawDumps.length} |`);
+  lines.push(`| Captured auth headers | ${tokens.length} |`);
+  if (toolCounts.size) {
+    lines.push("", "### Tool Call Summary", "", "| Tool | Count |", "| --- | ---: |");
+    [...toolCounts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).forEach(([name, count]) => {
+      lines.push(`| ${mdEscapeInline(name)} | ${count} |`);
+    });
+  }
+  return lines.join("\n");
 }
 
 function renderCc2mdAssistant(turn, subagentLinks = new Map()) {
@@ -917,8 +1038,10 @@ function renderRequestOverviewTable(items) {
   const lines = ["| # | Time | Method | Status | Duration | URL |", "| ---: | --- | --- | --- | ---: | --- |"];
   items.forEach((item, index) => {
     const event = item.event;
+    const n = item.index || event?._traceIndex || index + 1;
+    const number = item.anchor ? `[${n}](#${item.anchor})` : n;
     lines.push([
-      index + 1,
+      number,
       mdEscapeInline(requestEventTime(event)),
       mdEscapeInline(requestEventMethod(event)),
       mdEscapeInline(requestEventStatus(event)),
@@ -927,6 +1050,15 @@ function renderRequestOverviewTable(items) {
     ].join(" | ").replace(/^/, "| ").replace(/$/, " |"));
   });
   return lines.join("\n");
+}
+
+function renderTurnRequestTable(events) {
+  return renderRequestOverviewTable((events || []).map((event) => ({
+    event,
+    index: event._traceIndex,
+    anchor: event._traceIndex ? `request-log-${event._traceIndex}` : "",
+    label: event.request?.url || event.type || `event ${event._traceIndex || ""}`,
+  })));
 }
 
 function renderMaybeJsonBlock(value, lang = "json") {
@@ -978,12 +1110,13 @@ function renderCapturedRequestLog(events, rawDumps, runDir) {
   lines.push(`Captured \`${events.length}\` normalized log events from \`logs.jsonl\`.`);
   lines.push(`Captured \`${rawDumps.length}\` raw dump files from \`raw/*.json\`.`, "");
   if (events.length) {
-    const items = events.map((event, index) => ({ event, label: event.request?.url || event.type || `event ${index + 1}` }));
+    const items = events.map((event, index) => ({ event, index: index + 1, anchor: `request-log-${index + 1}`, label: event.request?.url || event.type || `event ${index + 1}` }));
     lines.push("### Request Overview", "", renderRequestOverviewTable(items), "");
     lines.push("### Normalized Events (`logs.jsonl`)", "");
     events.forEach((event, index) => {
       const label = event.request?.url || event.type || `event ${index + 1}`;
       const summary = `${index + 1}. ${requestEventMethod(event)} ${shortUrl(label)}${requestEventStatus(event) ? ` [${requestEventStatus(event)}]` : ""}`;
+      lines.push(`<a id="request-log-${index + 1}"></a>`);
       lines.push(detailsBlock(summary, renderRequestEventDetails(event, label)), "");
     });
   }
@@ -1066,6 +1199,7 @@ function renderCc2mdTraceMarkdown({ runDir, runMeta, events, tokens, rollouts, r
   }
 
   const turns = buildTraceTurns(main, events);
+  md.push(renderTraceSummary({ turns, subagents, events, rawDumps, tokens }), "", "---", "");
   if (!turns.length) {
     md.push("No conversation turns found.");
   }
@@ -1721,7 +1855,38 @@ async function shutdownProxy(port) {
 
 function findRecentCodexRollouts(startMs) {
   const root = path.join(codexHome(), "sessions");
-  return walkFiles(root).filter((file) => file.endsWith(".jsonl")).map((file) => ({ file, mtimeMs: fs.statSync(file).mtimeMs })).filter((item) => item.mtimeMs >= startMs - 5000).sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 5);
+  const windowStart = startMs - 5000;
+  const candidates = walkFiles(root).filter((file) => file.endsWith(".jsonl")).map((file) => {
+    const stat = fs.statSync(file);
+    const meta = readRolloutSessionMetaFile(file);
+    return { file, mtimeMs: stat.mtimeMs, timestampMs: parseIso(meta.timestamp), meta };
+  }).filter((item) => item.mtimeMs >= windowStart || (item.timestampMs != null && item.timestampMs >= windowStart));
+
+  let roots = candidates.filter((item) => !isSubagentMeta(item.meta) && item.timestampMs != null && item.timestampMs >= windowStart);
+  if (!roots.length) roots = candidates.filter((item) => !isSubagentMeta(item.meta) && item.mtimeMs >= windowStart);
+
+  const included = [];
+  const ids = new Set();
+  const include = (item) => {
+    if (!item || included.some((existing) => existing.file === item.file)) return;
+    included.push(item);
+    if (item.meta?.id) ids.add(item.meta.id);
+  };
+  roots.sort((a, b) => (a.timestampMs || a.mtimeMs) - (b.timestampMs || b.mtimeMs)).forEach(include);
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of candidates) {
+      if (!isSubagentMeta(item.meta)) continue;
+      if (!ids.has(parentThreadIdFromMeta(item.meta))) continue;
+      if (included.some((existing) => existing.file === item.file)) continue;
+      include(item);
+      changed = true;
+    }
+  }
+
+  return included.sort((a, b) => (a.timestampMs || a.mtimeMs) - (b.timestampMs || b.mtimeMs)).map(({ file, mtimeMs, timestampMs }) => ({ file, mtimeMs, timestampMs }));
 }
 
 async function runCodex(opts) {
