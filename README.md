@@ -1,17 +1,15 @@
 # agent-trace
 
-Trace Claude Code and Codex CLI sessions, keep local JSON artifacts, and generate self-contained HTML and Markdown reports.
-
-The CLI is intentionally shaped like `claude-trace`, but it supports both agents:
+Trace Claude Code and Codex CLI sessions, keep local JSON artifacts, and generate Markdown/HTML reports plus training-oriented JSONL.
 
 ```sh
 agent-trace cc
 agent-trace codex
 ```
 
-`agent-trace cc` runs Claude Code through a local forwarding proxy by setting `ANTHROPIC_BASE_URL`, then writes request/response pairs to JSONL. A Node loader is still injected as a fallback for older Node-based Claude Code builds, but current native Claude Code builds are captured by the proxy.
+`agent-trace cc` launches Claude Code behind a local Anthropic-compatible forwarding proxy.
 
-`agent-trace codex` uses a local forwarding proxy because Codex CLI is a native binary. It points Codex at `chatgpt_base_url` when you are logged in with `codex login`, or `openai_base_url` when `OPENAI_API_KEY` is present.
+`agent-trace codex` launches Codex CLI and, when you are logged in with `codex login`, captures the real ChatGPT websocket model payloads through a local HTTPS CONNECT MITM proxy. It does not override `openai_base_url` or `chatgpt_base_url` in login mode. A per-run local CA is passed through `CODEX_CA_CERTIFICATE`, and Codex Apps are disabled for the traced process to avoid remote MCP traffic being intercepted by the MITM proxy.
 
 ## Install
 
@@ -27,178 +25,178 @@ During development:
 node ./bin/agent-trace.js --help
 ```
 
-## Claude Code
+## Common Usage
 
-Use your Claude Code proxy endpoint if needed:
-
-```sh
-export CLAUDE_TRACE_API_ENDPOINT=http://localhost:8082
-```
-
-Start Claude Code and record traffic:
+Trace Claude Code:
 
 ```sh
 agent-trace cc
 ```
 
-Run a one-shot Claude Code prompt and record traffic:
-
-```sh
-agent-trace cc -- -p "explain this repo" --model sonnet
-```
-
-Record all API requests:
-
-```sh
-agent-trace cc --include-all-requests
-```
-
-Run Claude with arguments:
-
-```sh
-agent-trace cc --run-with chat --model sonnet-3.5
-```
-
-Extract auth headers seen in Claude Code API traffic:
-
-```sh
-agent-trace cc --extract-token
-```
-
-`agent-trace` without a subcommand defaults to `cc`, so this also works:
-
-```sh
-agent-trace --include-all-requests
-```
-
-## Codex
-
-Start Codex and record traffic:
+Trace Codex:
 
 ```sh
 agent-trace codex
 ```
 
-Capture auth headers into `tokens.jsonl` while showing only safe previews unless token extraction is enabled:
+Pass arguments to the launched agent after `--`:
 
 ```sh
-agent-trace codex --extract-token
+agent-trace cc -- -p "explain this repo" --model sonnet
+agent-trace codex -- --yolo
+agent-trace codex -- exec --dangerously-bypass-approvals-and-sandbox "explain this repo"
 ```
 
-When `--extract-token` is used, `report.html` and `report.md` render the full captured auth header value in the auth section. Treat the reports as sensitive.
-
-Pass normal Codex arguments after `--`:
+Choose a different trace directory:
 
 ```sh
-agent-trace codex -- -C /path/to/repo --search "find the parser entry point"
+agent-trace codex --trace-dir traces -- --yolo
 ```
 
-Force ChatGPT login mode:
+Capture auth headers:
 
 ```sh
-agent-trace codex --auth chatgpt-login
+agent-trace codex --extract-token -- --yolo
+agent-trace cc --extract-token
 ```
 
-Force API-key mode:
+`--extract-token` writes full captured auth header values to `tokens.jsonl` and renders them in the reports. Treat those artifacts as secrets.
+
+## Claude Code
+
+Use an Anthropic-compatible proxy endpoint if needed:
+
+```sh
+export CLAUDE_TRACE_API_ENDPOINT=http://localhost:8082
+agent-trace cc
+```
+
+Useful Claude options:
+
+```sh
+agent-trace cc --include-all-requests
+agent-trace cc --run-with chat --model sonnet-3.5
+agent-trace cc --cc-bin /path/to/claude
+```
+
+`agent-trace` without a subcommand is an alias for `agent-trace cc`.
+
+## Codex
+
+For normal logged-in Codex use:
+
+```sh
+codex login
+agent-trace codex -- --yolo
+```
+
+What happens in ChatGPT login mode:
+
+- model websocket requests to `chatgpt.com/backend-api/codex/responses` are captured at the wire level
+- decoded `response.create` request bodies are written to `logs.jsonl` and rendered in reports
+- exact websocket payload bytes are kept as `body_base64` with SHA-256 hashes
+- Codex rollout JSONL is linked so tool calls, tool results, diffs, timings, and token usage can be reconstructed
+- `--disable apps` is added to the launched Codex command to prevent remote Codex Apps/MCP startup traffic from being broken by the tracing proxy
+
+Force auth mode only when auto-detection is wrong:
+
+```sh
+agent-trace codex --auth chatgpt-login -- --yolo
+```
+
+API-key mode is supported, but it is not the main path for logged-in Codex:
 
 ```sh
 export OPENAI_API_KEY=...
-agent-trace codex --auth api-key
+agent-trace codex --auth api-key -- "explain this repo"
 ```
 
-Override proxy URLs when Codex changes provider paths:
+## Generated Files
+
+Trace runs are written to:
 
 ```sh
-agent-trace codex --base-url http://127.0.0.1:5055 --upstream-url https://chatgpt.com/backend-api/codex
+.agent-trace/trace-YYYY-MM-DD-HH-MM-SS/
 ```
 
-Capture Codex login-mode model traffic with a local HTTPS CONNECT MITM proxy:
+Each run may include:
 
-```sh
-agent-trace codex --capture-model-requests --extract-token
-```
+- `logs.jsonl`: normalized captured events, including decoded Codex websocket frames when available
+- `tokens.jsonl`: captured auth headers when `--extract-token` is used
+- `raw/*.json`: raw proxy connection/request dumps
+- `run.json`: command, auth mode, capture mode, exit status, and linked rollout files
+- `report.md`: Markdown report
+- `report.html`: self-contained HTML report
+- `subagent-*.md`: separate Markdown pages for subagent conversations
+- `training.jsonl`: generated by `--export-training-jsonl`
 
-For ChatGPT-login Codex sessions this keeps Codex on its normal `chatgpt.com/backend-api/codex/responses` websocket path and injects a per-run local CA through `CODEX_CA_CERTIFICATE`. The captured websocket frames keep exact `body_base64` bytes and, when possible, decoded JSON bodies such as `response.create`.
+## Markdown Report
 
-## Reports
+The Markdown report follows the `cc2md` conversation shape and adds trace-only details:
 
-Trace runs are written to `.agent-trace/trace-YYYY-MM-DD-HH-MM-SS/`.
+- prominent `## User` and `## Assistant` blocks
+- tool calls and tool results
+- fenced `diff` blocks for edit-like tools
+- per-turn timing and token usage, including cached input tokens
+- exact prompt messages sent to the model when captured
+- folded system/developer/environment context
+- raw turn context from Codex rollout logs
+- captured request/response bodies and websocket frames
+- links to subagent Markdown pages
 
-Each run includes:
-
-- `logs.jsonl`: normalized trace events
-- `tokens.jsonl`: captured auth headers when `--extract-token` is used; file mode is set to `0600`
-- `raw/*.json`: raw Codex proxy dumps when using Codex mode
-- `run.json`: command and session metadata
-- `report.html`: self-contained browser report
-- `report.md`: Markdown report for reading, search, and sharing inside private tooling
-- `subagent-*.md`: separate Markdown pages for subagent conversations, linked from `report.md`
-
-The Markdown report follows the `cc2md` conversation shape: session header, `## Codex Metadata`, repeated `## User` / `## Assistant` blocks, `**Tool: name**` tool calls, collapsible tool results, and fenced `diff` blocks for edit-like tools. User input stays prominent in the normal `## User` blocks. `agent-trace` adds richer per-turn `<details>` sections with timing, model token usage, cached token usage, the exact prompt messages sent to the agent, folded system/developer/environment context, raw turn context, captured API requests, and captured auth headers. Captured requests are rendered as Markdown overview tables plus per-request details for method, URL, status, duration, headers, body, response, and complete raw JSON. The final `Captured Request Log` section contains every normalized `logs.jsonl` event and every raw `raw/*.json` dump so startup requests and unmatched proxy traffic are not lost.
-
-Generate HTML from a JSONL log:
-
-```sh
-agent-trace --generate-html logs.jsonl report.html
-```
-
-Generate Markdown from a trace directory:
+Generate or regenerate reports from an existing trace directory:
 
 ```sh
 agent-trace --generate-md .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
+agent-trace --generate-html .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
 ```
 
-Generate Markdown from a JSONL log:
+Generate from a standalone JSONL file:
 
 ```sh
 agent-trace --generate-md logs.jsonl report.md
+agent-trace --generate-html logs.jsonl report.html
 ```
 
-Include all requests in a generated HTML report:
-
-```sh
-agent-trace --generate-html logs.jsonl report.html --include-all-requests
-```
-
-Generate an index for all local runs:
+Generate an index:
 
 ```sh
 agent-trace --index
 ```
 
-The index is written to:
+This writes `.agent-trace/index.html`.
 
-```sh
-.agent-trace/index.html
-```
+## Validation
 
-## Validation and Training Export
-
-Validate that a trace has the expected files, readable Codex rollouts, reconstructed turns, token usage, tool calls, edit calls, and subagent links:
+Validate a trace after a run:
 
 ```sh
 agent-trace --validate-trace .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
 ```
 
-Export a structured JSONL dataset for downstream training or fine-tuning preprocessing:
+Validation checks renderability, Codex rollout linkage, reconstructed turns, token usage, tool calls, edit calls, subagent links, ordering issues, and raw model request capture.
+
+## Training Export
+
+Export one JSONL row per reconstructed turn:
 
 ```sh
 agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS
 ```
 
-The export writes `training.jsonl`. Each row is one reconstructed turn and includes:
+The export writes `training.jsonl`. Each row includes:
 
-- trace/session metadata, including subagent parent thread IDs
-- exact prompt messages sent to the agent, including system/developer/user messages when available
+- trace and session metadata
+- prompt messages, including system/developer/user messages when available
 - assistant text and structured assistant parts
-- tool calls, tool inputs, tool outputs, and whether the tool is an edit tool
-- per-turn and cumulative model token usage, including cached input tokens
+- tool calls, tool inputs, tool outputs, and edit-tool markers
+- per-turn and cumulative token usage, including cached input tokens
 - timing fields such as turn duration and time to first token
-- captured API request/response events linked to the turn
-- `rollout_index` fields that point back to the exact Codex rollout JSONL line order
-- `raw_model_requests` when `/v1/responses` or `/v1/chat/completions` request bodies were captured by the proxy
+- captured API events linked to the turn
+- Codex rollout line indexes for provenance
+- raw model requests when Codex websocket `response.create` frames were captured
 
-Training export redacts sensitive header-like fields by default, including `authorization`, cookies, API keys, and token fields. For a fully private, controlled dataset you can opt into the unredacted export:
+Sensitive header-like fields are redacted by default. For a private, controlled dataset:
 
 ```sh
 agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS training.full.jsonl --include-sensitive
@@ -206,11 +204,48 @@ agent-trace --export-training-jsonl .agent-trace/trace-YYYY-MM-DD-HH-MM-SS train
 
 Treat unredacted exports as secrets.
 
-For Codex login-mode sessions, use `--capture-model-requests` when you need wire-level model payloads. When capture succeeds, `training.jsonl` sets `trace.provenance.prompt_source` to the proxy-captured Responses request body and stores the decoded `response.create` websocket frame in `raw_model_requests`. Each websocket frame also keeps `body_base64` and SHA-256 fields so training pipelines can reprocess the exact bytes.
+## Options
+
+Common:
+
+```text
+--trace-dir <dir>              Output root, default .agent-trace
+--port <port>                  Local proxy port
+--extract-token                Capture auth headers into tokens.jsonl
+--include-all-requests         Claude-compatible flag for broader request capture
+--generate-md <trace|jsonl>    Generate Markdown
+--generate-html <trace|jsonl>  Generate HTML
+--export-training-jsonl <dir>  Generate training.jsonl
+--validate-trace <dir>         Validate a trace
+--index                        Generate .agent-trace/index.html
+```
+
+Claude:
+
+```text
+--cc-bin <path>                Claude Code binary
+--upstream-url <url>           Anthropic-compatible upstream
+--run-with <arg>               Append one argument to Claude Code
+```
+
+Codex:
+
+```text
+--codex-bin <path>             Codex binary
+--auth auto|chatgpt-login|api-key
+```
+
+Compatibility/advanced Codex flags:
+
+```text
+--capture-model-requests       Kept for old scripts; ChatGPT login mode now captures model traffic by default
+--base-url <url>               Advanced API-key/custom-provider override; not used for normal ChatGPT login tracing
+--upstream-url <url>           Advanced API-key/custom-provider upstream override
+```
 
 ## Notes
 
-- Trace output can contain prompts, code, file contents, tool output, and model responses. Treat `.agent-trace/` as private.
-- Claude Code tracing uses a local Anthropic-compatible forwarding proxy and sets `ANTHROPIC_BASE_URL` for the launched process. `CLAUDE_TRACE_API_ENDPOINT` or `--upstream-url` can point that proxy at another Anthropic-compatible upstream.
-- Codex tracing works for logged-in use. Default mode routes `chatgpt_base_url` through a local loopback proxy for backend requests and uses Codex rollout JSONL for model messages. `--capture-model-requests` additionally starts a local HTTPS CONNECT MITM proxy for the login-mode websocket model path and does not override `openai_base_url`.
-- `--extract-token` writes sensitive headers to `tokens.jsonl` and renders them in `report.html` and `report.md`. Use it only in a private terminal and do not publish trace artifacts.
+- Trace output can contain prompts, source code, file contents, tool outputs, model responses, and auth headers. Keep `.agent-trace/` private.
+- ChatGPT-login Codex tracing is the recommended Codex path. It captures the real model websocket payloads and uses rollout logs for tool-level reconstruction.
+- API-key Codex tracing is still available, but it uses a forwarding proxy path and may not match the normal logged-in Codex CLI experience.
+- `--extract-token` is intentionally explicit because it writes sensitive values.
