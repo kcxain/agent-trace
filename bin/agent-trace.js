@@ -9,22 +9,35 @@ import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { Readable } from "node:stream";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_TRACE_DIR = ".agent-trace";
 
-function relaunchWithNodeEnvProxyIfNeeded() {
+async function relaunchWithNodeEnvProxyIfNeeded() {
   const hasProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy;
   if (!hasProxy || process.env.NODE_USE_ENV_PROXY === "1" || process.env.AGENT_TRACE_NODE_ENV_PROXY_REEXEC === "1") return false;
-  const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
     cwd: process.cwd(),
     stdio: "inherit",
     env: { ...process.env, NODE_USE_ENV_PROXY: "1", AGENT_TRACE_NODE_ENV_PROXY_REEXEC: "1" },
   });
-  if (result.error) throw result.error;
-  process.exit(result.status ?? 1);
+  const handlers = ["SIGINT", "SIGTERM"].map((signal) => {
+    const handler = () => {
+      try {
+        if (!child.killed) child.kill(signal);
+      } catch {
+        // Best effort: the child may already have exited.
+      }
+    };
+    process.on(signal, handler);
+    return { signal, handler };
+  });
+  const exit = await waitForExit(child);
+  for (const { signal, handler } of handlers) process.removeListener(signal, handler);
+  process.exitCode = exit.code ?? signalExitCode(exit.signal);
+  return true;
 }
 
 function usage() {
@@ -170,6 +183,38 @@ function waitForExit(child) {
   return new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
 }
 
+function signalExitCode(signal) {
+  if (signal === "SIGINT") return 130;
+  if (signal === "SIGTERM") return 143;
+  return 1;
+}
+
+function waitForExitWithSignals(child, signals = ["SIGINT", "SIGTERM"], timeoutMs = 2500) {
+  const exitPromise = waitForExit(child);
+  let timer = null;
+  let handlers = [];
+  const signalPromise = new Promise((resolve) => {
+    handlers = signals.map((signal) => {
+      const handler = () => {
+        try {
+          if (!child.killed) child.kill(signal);
+        } catch {
+          // Best effort: the child may already have exited.
+        }
+        if (!timer) {
+          timer = setTimeout(() => resolve({ code: null, signal }), timeoutMs);
+        }
+      };
+      process.on(signal, handler);
+      return { signal, handler };
+    });
+  });
+  return Promise.race([exitPromise, signalPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+    for (const { signal, handler } of handlers) process.removeListener(signal, handler);
+  });
+}
+
 function walkFiles(dir) {
   if (!fs.existsSync(dir)) return [];
   const out = [];
@@ -205,6 +250,19 @@ function readJsonl(file, maxLines = 5000) {
 
 function writeJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function ignoreSocketErrors(socket) {
+  if (socket && typeof socket.on === "function") socket.on("error", () => {});
+}
+
+function safeSocketWrite(socket, data) {
+  if (!socket || socket.destroyed || socket.writable === false) return;
+  try {
+    socket.write(data, () => {});
+  } catch {
+    // Connection shutdown races are expected while traced CLIs are exiting.
+  }
 }
 
 function escapeHtml(value) {
@@ -1853,15 +1911,19 @@ async function runClaude(opts) {
   console.log(`agent-trace: tracing Claude Code to ${runDir}`);
   console.log(`agent-trace: proxy listening on ${proxy.port}`);
   const child = spawn(opts.ccBin, opts.agentArgs, { cwd: process.cwd(), stdio: "inherit", env });
-  const exit = await waitForExit(child);
-  await shutdownProxy(proxy.port);
+  let exit = { code: 1, signal: null };
+  try {
+    exit = await waitForExitWithSignals(child);
+  } finally {
+    await shutdownProxy(proxy.port).catch((error) => console.error(`agent-trace: proxy shutdown failed: ${error.message || error}`));
+  }
   const meta = { agent: "cc", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.ccBin, args: opts.agentArgs, upstream_url: upstreamUrl, base_url: baseUrl, exit, log_file: logFile, token_file: tokenFile };
   writeJson(path.join(runDir, "run.json"), meta);
   const report = generateRunHtml(runDir);
   const markdown = generateRunMarkdown(runDir);
   console.log(`agent-trace: HTML report: ${report}`);
   console.log(`agent-trace: Markdown report: ${markdown}`);
-  process.exitCode = exit.code ?? 1;
+  process.exitCode = exit.code ?? signalExitCode(exit.signal);
 }
 
 function codexHome() {
@@ -2251,24 +2313,27 @@ function startCodexMitmProxy({ port, runDir, logFile, tokenFile, extractToken, c
     res.writeHead(501).end("agent-trace MITM proxy only supports CONNECT");
   });
   server.on("connect", (req, clientSocket, head) => {
+    ignoreSocketErrors(clientSocket);
     sockets.add(clientSocket);
     clientSocket.on("close", () => sockets.delete(clientSocket));
     const [host, portText = "443"] = String(req.url || "").split(":");
     const targetPort = Number(portText || 443);
     if (host !== "chatgpt.com" || targetPort !== 443) {
       connectRawTarget(host, targetPort, (upstream) => {
+        ignoreSocketErrors(upstream);
         sockets.add(upstream);
         upstream.on("close", () => sockets.delete(upstream));
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head.length) upstream.write(head);
+        safeSocketWrite(clientSocket, "HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) safeSocketWrite(upstream, head);
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
       }, (error) => clientSocket.destroy(error));
       return;
     }
 
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    safeSocketWrite(clientSocket, "HTTP/1.1 200 Connection Established\r\n\r\n");
     const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext, ALPNProtocols: ["http/1.1"] });
+    ignoreSocketErrors(tlsSocket);
     let initial = Buffer.alloc(0);
     tlsSocket.on("data", function onInitialData(chunk) {
       initial = Buffer.concat([initial, chunk]);
@@ -2285,13 +2350,14 @@ function startCodexMitmProxy({ port, runDir, logFile, tokenFile, extractToken, c
         }
       }
       connectTls(target, (upstream) => {
+        ignoreSocketErrors(upstream);
         sockets.add(upstream);
         upstream.on("close", () => sockets.delete(upstream));
         const upstreamHead = parsed.rawHead
           .replace(/^Host: .*$/im, "Host: chatgpt.com")
           .replace(/^Sec-WebSocket-Extensions:.*\r?\n/im, "");
-        upstream.write(`${upstreamHead}\r\n\r\n`);
-        if (parsed.rest.length) upstream.write(parsed.rest);
+        safeSocketWrite(upstream, `${upstreamHead}\r\n\r\n`);
+        if (parsed.rest.length) safeSocketWrite(upstream, parsed.rest);
         const isWebSocket = /websocket/i.test(parsed.headers.upgrade || "") || /\/backend-api\/codex\/responses\b/.test(target.pathname);
         let wroteClose = false;
         const close = (error) => {
@@ -2313,11 +2379,11 @@ function startCodexMitmProxy({ port, runDir, logFile, tokenFile, extractToken, c
           if (parsed.rest.length) clientLogger(parsed.rest);
           tlsSocket.on("data", (data) => {
             clientLogger(data);
-            upstream.write(data);
+            safeSocketWrite(upstream, data);
           });
           upstream.on("data", (data) => {
             upstreamLogger(data);
-            tlsSocket.write(data);
+            safeSocketWrite(tlsSocket, data);
           });
         } else {
           tlsSocket.pipe(upstream);
@@ -2507,16 +2573,20 @@ async function runCodex(opts) {
   console.log(`agent-trace: proxy listening on ${proxy.port}${useLoginMitm ? " (Codex HTTPS MITM)" : ""}`);
   console.log(`agent-trace: tracing Codex to ${runDir}`);
   const child = spawn(opts.codexBin, args, { cwd: process.cwd(), stdio: "inherit", env });
-  const exit = await waitForExit(child);
-  if (useLoginMitm && typeof proxy.destroy === "function") proxy.destroy();
-  else await shutdownProxy(proxy.port);
+  let exit = { code: 1, signal: null };
+  try {
+    exit = await waitForExitWithSignals(child);
+  } finally {
+    if (useLoginMitm && typeof proxy.destroy === "function") proxy.destroy();
+    else await shutdownProxy(proxy.port).catch((error) => console.error(`agent-trace: proxy shutdown failed: ${error.message || error}`));
+  }
   const meta = { agent: "codex", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy", upstream_url: auth.upstreamUrl, openai_upstream_url: auth.openaiUpstreamUrl, base_url: useLoginMitm ? null : baseUrl, mitm_ca: useLoginMitm ? proxy.caPem : null, exit, log_file: logFile, token_file: tokenFile, rollouts: findRecentCodexRollouts(startedMs) };
   writeJson(path.join(runDir, "run.json"), meta);
   const report = generateRunHtml(runDir);
   const markdown = generateRunMarkdown(runDir);
   console.log(`agent-trace: HTML report: ${report}`);
   console.log(`agent-trace: Markdown report: ${markdown}`);
-  process.exitCode = exit.code ?? 1;
+  process.exitCode = exit.code ?? signalExitCode(exit.signal);
 }
 
 async function main() {
@@ -2562,9 +2632,11 @@ async function main() {
   return runClaude(opts);
 }
 
-relaunchWithNodeEnvProxyIfNeeded();
-
-main().catch((error) => {
+try {
+  if (!(await relaunchWithNodeEnvProxyIfNeeded())) {
+    await main();
+  }
+} catch (error) {
   console.error(`agent-trace: ${error.message}`);
   process.exit(1);
-});
+}
