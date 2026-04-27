@@ -74,7 +74,7 @@ Codex options:
   --codex-bin <path>                     Codex binary (default: codex)
   --auth <mode>                          auto, api-key, or chatgpt-login (default: auto)
   --base-url <url>                       Override URL passed to Codex config
-  --capture-model-requests               Capture Codex model traffic; login mode uses a local HTTPS MITM proxy
+  --capture-model-requests               Compatibility flag; ChatGPT login mode captures model traffic by default
 
 Examples:
   agent-trace cc
@@ -180,7 +180,17 @@ function stamp() {
 }
 
 function waitForExit(child) {
-  return new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (exit) => {
+      if (settled) return;
+      settled = true;
+      resolve(exit);
+    };
+    child.once("exit", (code, signal) => done({ code, signal }));
+    child.once("close", (code, signal) => done({ code, signal }));
+    child.once("error", (error) => done({ code: 1, signal: null, error: String(error) }));
+  });
 }
 
 function signalExitCode(signal) {
@@ -2560,12 +2570,12 @@ async function runCodex(opts) {
   const logFile = path.join(runDir, "logs.jsonl");
   const tokenFile = path.join(runDir, "tokens.jsonl");
   const auth = resolveCodexAuth(opts);
-  const useLoginMitm = auth.mode === "chatgpt-login" && opts.captureModelRequests;
+  const useLoginMitm = auth.mode === "chatgpt-login";
   const proxy = useLoginMitm
     ? await startCodexMitmProxy({ port: opts.port, runDir, logFile, tokenFile, extractToken: opts.extractToken, certs: ensureCodexMitmCerts(runDir) })
     : await startForwardProxy({ port: opts.port, upstreamUrl: auth.upstreamUrl, openaiUpstreamUrl: auth.openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken: opts.extractToken });
   const baseUrl = opts.baseUrl || (auth.mode === "api-key" ? `http://127.0.0.1:${proxy.port}/v1` : `http://127.0.0.1:${proxy.port}`);
-  const args = useLoginMitm ? [...opts.agentArgs] : ["-c", `${auth.configKey}="${baseUrl}"`, ...opts.agentArgs];
+  const args = useLoginMitm ? ["--disable", "apps", ...opts.agentArgs] : ["-c", `${auth.configKey}="${baseUrl}"`, ...opts.agentArgs];
   const env = useLoginMitm
     ? { ...process.env, HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}`, https_proxy: `http://127.0.0.1:${proxy.port}`, http_proxy: `http://127.0.0.1:${proxy.port}`, all_proxy: `http://127.0.0.1:${proxy.port}`, CODEX_CA_CERTIFICATE: proxy.caPem }
     : process.env;
@@ -2632,11 +2642,13 @@ async function main() {
   return runClaude(opts);
 }
 
-try {
+async function cli() {
   if (!(await relaunchWithNodeEnvProxyIfNeeded())) {
     await main();
   }
-} catch (error) {
+}
+
+cli().catch((error) => {
   console.error(`agent-trace: ${error.message}`);
   process.exit(1);
-}
+});
