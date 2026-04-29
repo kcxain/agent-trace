@@ -1,16 +1,11 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import http from "node:http";
-import net from "node:net";
-import tls from "node:tls";
 import os from "node:os";
 import path from "node:path";
-import crypto from "node:crypto";
-import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn } from "node:child_process";
-import { Readable } from "node:stream";
+import { ensureCodexMitmCerts, shutdownProxy, startCodexMitmProxy, startForwardProxy } from "../src/proxy.js";
+import { spawn } from "node:child_process";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_TRACE_DIR = ".agent-trace";
@@ -23,7 +18,7 @@ async function relaunchWithNodeEnvProxyIfNeeded() {
     stdio: "inherit",
     env: { ...process.env, NODE_USE_ENV_PROXY: "1", AGENT_TRACE_NODE_ENV_PROXY_REEXEC: "1" },
   });
-  const handlers = ["SIGINT", "SIGTERM"].map((signal) => {
+  const handlers = ["SIGINT", "SIGTERM", "SIGHUP"].map((signal) => {
     const handler = () => {
       try {
         if (!child.killed) child.kill(signal);
@@ -43,18 +38,16 @@ async function relaunchWithNodeEnvProxyIfNeeded() {
 function usage() {
   console.log(`agent-trace
 
-Trace Claude Code or Codex CLI sessions and render local HTML reports.
+Trace Claude Code or Codex CLI sessions and render Markdown reports.
 
 Usage:
   agent-trace cc [options] [-- claude args...]
-  agent-trace codex [options] [-- codex args...]
+  agent-trace codex [agent-trace options] [-- codex args...]
   agent-trace [options]                  Alias for: agent-trace cc
 
-Claude-trace compatible options:
-  --include-all-requests                 Capture all provider API requests
-  --run-with <arg>                       Append an argument to the launched agent
+Trace options:
   --extract-token                        Capture detected auth headers during agent traffic
-  --generate-html <jsonl> [html]         Generate a self-contained HTML report from JSONL
+  --generate-html <jsonl|trace> [html]   Generate an optional HTML report
   --generate-md <trace-dir|jsonl> [md]   Generate a Markdown report
   --export-training-jsonl <trace-dir> [jsonl]
                                       Export a redacted training-oriented JSONL dataset
@@ -64,7 +57,7 @@ Claude-trace compatible options:
 
 Shared options:
   --trace-dir <dir>                      Trace output directory (default: .agent-trace)
-  --port <port>                          Local proxy port for Codex mode
+  --port <port>                          Local proxy port
   --upstream-url <url>                   Override provider upstream URL
 
 Claude Code options:
@@ -73,14 +66,17 @@ Claude Code options:
 Codex options:
   --codex-bin <path>                     Codex binary (default: codex)
   --auth <mode>                          auto, api-key, or chatgpt-login (default: auto)
-  --base-url <url>                       Override URL passed to Codex config
-  --capture-model-requests               Compatibility flag; ChatGPT login mode captures model traffic by default
+
+Codex argument passthrough:
+  Everything after -- is passed to Codex unchanged. Unknown options before --
+  are also passed through, but use -- if a Codex option name conflicts with
+  an agent-trace option. Codex mode proxies outbound traffic by default.
 
 Examples:
   agent-trace cc
-  agent-trace cc --include-all-requests
-  agent-trace cc --run-with chat --model sonnet-3.5
+  agent-trace cc -- chat --model sonnet-3.5
   agent-trace codex -- "explain this repo"
+  agent-trace codex -- --model gpt-5.1 "fix tests"
   agent-trace --generate-html .agent-trace/trace-.../logs.jsonl report.html
 `);
 }
@@ -89,7 +85,6 @@ function parse(argv) {
   const opts = {
     agent: "cc",
     traceDir: DEFAULT_TRACE_DIR,
-    includeAllRequests: false,
     extractToken: false,
     generateHtml: null,
     generateMd: null,
@@ -104,8 +99,6 @@ function parse(argv) {
     ccBin: "claude",
     codexBin: "codex",
     auth: "auto",
-    baseUrl: null,
-    captureModelRequests: false,
     includeSensitive: false,
     agentArgs: [],
     help: false,
@@ -120,10 +113,10 @@ function parse(argv) {
     if (arg === "--") {
       opts.agentArgs.push(...rest.slice(i + 1));
       break;
-    } else if (arg === "--include-all-requests") {
-      opts.includeAllRequests = true;
+    } else if (arg === "--include-all-requests" || arg === "--capture-model-requests") {
+      throw new Error(`${arg} was removed; agent-trace captures relevant traffic by default`);
     } else if (arg === "--run-with") {
-      opts.agentArgs.push(requireValue(rest, ++i, arg));
+      throw new Error("--run-with was removed; pass agent arguments after -- instead");
     } else if (arg === "--extract-token") {
       opts.extractToken = true;
     } else if (arg === "--generate-html") {
@@ -152,9 +145,7 @@ function parse(argv) {
     } else if (arg === "--auth") {
       opts.auth = requireValue(rest, ++i, arg);
     } else if (arg === "--base-url") {
-      opts.baseUrl = requireValue(rest, ++i, arg);
-    } else if (arg === "--capture-model-requests") {
-      opts.captureModelRequests = true;
+      throw new Error("--base-url was removed; use --upstream-url for custom providers, and pass Codex args after --");
     } else if (arg === "--include-sensitive") {
       opts.includeSensitive = true;
     } else if (arg === "-h" || arg === "--help") {
@@ -187,19 +178,27 @@ function waitForExit(child) {
       settled = true;
       resolve(exit);
     };
+    const doneIfAlreadyExited = () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        done({ code: child.exitCode, signal: child.signalCode });
+      }
+    };
+    doneIfAlreadyExited();
     child.once("exit", (code, signal) => done({ code, signal }));
     child.once("close", (code, signal) => done({ code, signal }));
     child.once("error", (error) => done({ code: 1, signal: null, error: String(error) }));
+    setImmediate(doneIfAlreadyExited);
   });
 }
 
 function signalExitCode(signal) {
   if (signal === "SIGINT") return 130;
   if (signal === "SIGTERM") return 143;
+  if (signal === "SIGHUP") return 129;
   return 1;
 }
 
-function waitForExitWithSignals(child, signals = ["SIGINT", "SIGTERM"], timeoutMs = 2500) {
+function waitForExitWithSignals(child, signals = ["SIGINT", "SIGTERM", "SIGHUP"], timeoutMs = 2500) {
   const exitPromise = waitForExit(child);
   let timer = null;
   let handlers = [];
@@ -260,19 +259,6 @@ function readJsonl(file, maxLines = 5000) {
 
 function writeJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-function ignoreSocketErrors(socket) {
-  if (socket && typeof socket.on === "function") socket.on("error", () => {});
-}
-
-function safeSocketWrite(socket, data) {
-  if (!socket || socket.destroyed || socket.writable === false) return;
-  try {
-    socket.write(data, () => {});
-  } catch {
-    // Connection shutdown races are expected while traced CLIs are exiting.
-  }
 }
 
 function escapeHtml(value) {
@@ -623,7 +609,7 @@ function renderTokens(tokens) {
   }
   return [...map.values()].map((token) => `<div class="card token-card">
     <div><b>${escapeHtml(token.header || "token")}</b> <span class="muted">${escapeHtml(token.timestamp || "")}</span></div>
-    <pre class="token-value"><code>${escapeHtml(token.value || token.preview || "")}</code></pre>
+    <pre class="token-value"><code>${escapeHtml(token.preview || token.value || "")}</code></pre>
     <div class="muted">${(token.urls || []).map((url) => `<div>${escapeHtml(url)}</div>`).join("")}</div>
   </div>`).join("");
 }
@@ -1038,6 +1024,44 @@ function renderTokenUsageLines(usage, totalUsage, modelContextWindow, rateLimits
   return lines.join("\n");
 }
 
+function tokenValue(usage, key) {
+  const value = usage?.[key];
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function renderTokenUsageOverview(turns) {
+  const keys = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"];
+  const totals = Object.fromEntries(keys.map((key) => [key, 0]));
+  const hasValue = Object.fromEntries(keys.map((key) => [key, false]));
+  let totalDuration = 0;
+  let hasDuration = false;
+  const lines = ["## Token Usage Overview", "", `**Conversation Turns:** \`${turns.length}\`  `, "", "_Source: Codex rollout `token_count` events. Values are per-turn model token usage._", ""];
+  lines.push("| Turn | Duration | First Token | Input | Cached Input | Output | Reasoning Output | Total |", "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+  for (const [index, turn] of turns.entries()) {
+    const duration = Number.isFinite(Number(turn.duration_ms)) ? Number(turn.duration_ms) : null;
+    const firstToken = Number.isFinite(Number(turn.time_to_first_token_ms)) ? Number(turn.time_to_first_token_ms) : null;
+    if (duration != null) {
+      totalDuration += duration;
+      hasDuration = true;
+    }
+    const cells = [duration == null ? "" : `${duration}ms`, firstToken == null ? "" : `${firstToken}ms`];
+    for (const key of keys) {
+      const value = tokenValue(turn.usage, key);
+      if (value == null) {
+        cells.push("");
+      } else {
+        hasValue[key] = true;
+        totals[key] += value;
+        cells.push(String(value));
+      }
+    }
+    lines.push(`| Turn ${index + 1} | ${cells.join(" | ")} |`);
+  }
+  const totalCells = [hasDuration ? `${totalDuration}ms` : "", "", ...keys.map((key) => (hasValue[key] ? String(totals[key]) : ""))];
+  lines.push(`| **Total** | ${totalCells.join(" | ")} |`);
+  return lines.join("\n");
+}
+
 function renderPromptMessagesForTurn(turn, sessionMeta) {
   const lines = [];
   lines.push("### Prompts Sent To Agent", "");
@@ -1079,7 +1103,7 @@ function renderTraceEnhancement(turn, sessionMeta) {
   body.push("", "### Raw Turn Context", "", fence(JSON.stringify(turn.context || {}, null, 2), "json"));
   if (turn.api_events?.length) {
     body.push("", "### API Requests Captured During This Turn", "");
-    body.push("Full request and response bodies are kept once in `Captured Request Log`; this turn links to those canonical entries.", "");
+    body.push("Full request and response bodies are stored outside the report in `raw/*.json`; the report keeps only this overview.", "");
     body.push(renderTurnRequestTable(turn.api_events));
   }
   return detailsBlock("Agent Trace Details", body.join("\n"));
@@ -1195,11 +1219,29 @@ function renderRequestOverviewTable(items) {
   return lines.join("\n");
 }
 
+function requestOverviewItems(events, runDir = "", rawDumps = []) {
+  return (events || []).map((event, index) => ({
+    event,
+    index: event._traceIndex || index + 1,
+    label: event.request?.url || event.url || event.type || `event ${index + 1}`,
+    rawFile: rawDumps[index]?.file && runDir ? path.relative(runDir, rawDumps[index].file) : "",
+  }));
+}
+
+function renderRequestOverviewHtml(items) {
+  if (!items.length) return '<div class="muted">No captured requests.</div>';
+  const rows = items.map((item, index) => {
+    const event = item.event;
+    const raw = item.rawFile ? `<code>${escapeHtml(item.rawFile)}</code>` : "";
+    return `<tr><td>${escapeHtml(item.index || index + 1)}</td><td>${escapeHtml(requestEventTime(event))}</td><td>${escapeHtml(requestEventMethod(event))}</td><td>${escapeHtml(requestEventStatus(event))}</td><td>${escapeHtml(event?.duration_ms ?? "")}</td><td>${escapeHtml(shortUrl(requestEventUrl(event) || item.label || ""))}</td><td>${raw}</td></tr>`;
+  }).join("");
+  return `<table><thead><tr><th>#</th><th>Time</th><th>Method</th><th>Status</th><th>Duration</th><th>URL</th><th>Raw</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function renderTurnRequestTable(events) {
   return renderRequestOverviewTable((events || []).map((event) => ({
     event,
     index: event._traceIndex,
-    anchor: event._traceIndex ? `request-log-${event._traceIndex}` : "",
     label: event.request?.url || event.url || event.type || `event ${event._traceIndex || ""}`,
   })));
 }
@@ -1252,28 +1294,17 @@ function renderRequestEventDetails(event, title, rawFile = "") {
 function renderCapturedRequestLog(events, rawDumps, runDir) {
   const lines = ["## Captured Request Log", ""];
   lines.push(`Captured \`${events.length}\` normalized log events from \`logs.jsonl\`.`);
-  lines.push(`Captured \`${rawDumps.length}\` raw dump files from \`raw/*.json\`.`, "");
+  lines.push(`Captured \`${rawDumps.length}\` raw dump files under \`raw/\`. Full request/response payloads are intentionally not embedded in this report.`, "");
   if (events.length) {
-    const items = events.map((event, index) => ({ event, index: index + 1, anchor: `request-log-${index + 1}`, label: event.request?.url || event.url || event.type || `event ${index + 1}` }));
-    lines.push("### Request Overview", "", renderRequestOverviewTable(items), "");
-    lines.push("### Normalized Events (`logs.jsonl`)", "");
-    events.forEach((event, index) => {
-      const label = event.request?.url || event.type || `event ${index + 1}`;
-      const summary = `${index + 1}. ${requestEventMethod(event)} ${shortUrl(label)}${requestEventStatus(event) ? ` [${requestEventStatus(event)}]` : ""}`;
-      lines.push(`<a id="request-log-${index + 1}"></a>`);
-      lines.push(detailsBlock(summary, renderRequestEventDetails(event, label)), "");
-    });
+    lines.push("### Request Overview", "", renderRequestOverviewTable(requestOverviewItems(events, runDir, rawDumps)), "");
   }
   if (rawDumps.length) {
-    const items = rawDumps.map((dump, index) => ({ event: dump.data, label: path.relative(runDir, dump.file) || `raw ${index + 1}` }));
-    lines.push("### Raw Dump Overview", "", renderRequestOverviewTable(items), "");
-    lines.push("### Raw Dump Files (`raw/*.json`)", "");
+    lines.push("### Raw Files", "", "| # | File | Type | URL | Status |", "| ---: | --- | --- | --- | --- |");
     rawDumps.forEach((dump, index) => {
       const rel = path.relative(runDir, dump.file);
-      const label = dump.data?.request?.url || dump.data?.type || rel;
-      const summary = `${index + 1}. ${requestEventMethod(dump.data)} ${shortUrl(label)} (${rel})${requestEventStatus(dump.data) ? ` [${requestEventStatus(dump.data)}]` : ""}`;
-      lines.push(detailsBlock(summary, renderRequestEventDetails(dump.data, label, rel)), "");
+      lines.push(`| ${index + 1} | \`${mdEscapeInline(rel)}\` | ${mdEscapeInline(dump.data?.type || "")} | ${mdEscapeInline(shortUrl(dump.data?.request?.url || dump.data?.url || ""))} | ${mdEscapeInline(requestEventStatus(dump.data))} |`);
     });
+    lines.push("");
   }
   return lines.join("\n");
 }
@@ -1281,8 +1312,13 @@ function renderCapturedRequestLog(events, rawDumps, runDir) {
 function renderSubagentMarkdown(rollout, runMeta = {}) {
   const meta = sessionMetaFromRollout(rollout);
   const title = agentNicknameFromMeta(meta) || extractTitleFromRollout(rollout) || "Subagent";
+  const turns = buildTraceTurns(rollout, []);
   const md = [
     `# Subagent: ${title}`,
+    "",
+    renderTokenUsageOverview(turns),
+    "",
+    "---",
     "",
     `**Type:** ${agentRoleFromMeta(meta) || "unknown"}  `,
     `**Agent ID:** \`${meta.id || ""}\`  `,
@@ -1292,7 +1328,6 @@ function renderSubagentMarkdown(rollout, runMeta = {}) {
     "",
   ];
   md.push(...formatCodexMetadata(collectCodexMetadata(rollout, runMeta)));
-  const turns = buildTraceTurns(rollout, []);
   for (const turn of turns) {
     if (turn.user) md.push("**Prompt:**", "", turn.user, "");
     md.push(renderTraceEnhancement(turn, meta), "");
@@ -1306,69 +1341,77 @@ function renderCc2mdTraceMarkdown({ runDir, runMeta, events, tokens, rollouts, r
   const main = rollouts.find((rollout) => !isSubagentRollout(rollout)) || rollouts[0] || { lines: [], file: "" };
   const subagents = rollouts.filter((rollout) => rollout !== main && isSubagentRollout(rollout));
   const subagentMaps = buildSubagentLinkMap(subagents);
+  const subagentDir = "report-md";
   const meta = sessionMetaFromRollout(main);
   const title = extractTitleFromRollout(main);
   const sessionId = meta.id || path.basename(main.file || runDir);
   const project = meta.cwd || runMeta.cwd || process.cwd();
   const ts = meta.timestamp ? new Date(meta.timestamp).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC") : "";
-  const md = [`# ${title}`, "", `**Session:** \`${sessionId}\`  `, `**Project:** \`${project}\`  `];
-  if (ts) md.push(`**Date:** ${ts}  `);
-  md.push("", "---", "");
-  md.push(...formatCodexMetadata(collectCodexMetadata(main, runMeta)));
-  md.push("## Agent Trace Metadata", "");
-  md.push(`**Trace Directory:** \`${path.resolve(runDir)}\`  `);
-  md.push(`**Agent:** \`${runMeta.agent || "unknown"}\`  `);
-  md.push(`**Command:** \`${[runMeta.command, ...(runMeta.args || [])].filter(Boolean).join(" ")}\`  `);
-  if (runMeta.auth_mode) md.push(`**Auth Mode:** \`${runMeta.auth_mode}\`  `);
-  if (runMeta.base_url) md.push(`**Base URL:** \`${runMeta.base_url}\`  `);
-  md.push(`**Captured API Events:** \`${events.length}\`  `);
-  md.push(`**Captured Auth Headers:** \`${tokens.length}\`  `, "", "---", "");
-  if (tokens.length) {
-    md.push("## Captured Auth Headers", "");
-    const seen = new Set();
-    let index = 0;
-    for (const token of tokens) {
-      const key = `${token.header || ""}\n${token.value || token.preview || ""}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      index += 1;
-      md.push(detailsBlock(`Token ${index}: ${token.header || "token"}`, [
-        token.timestamp ? `**Time:** \`${token.timestamp}\`  ` : "",
-        token.url ? `**URL:** \`${token.url}\`  ` : "",
-        "",
-        fence(token.value || token.preview || "", ""),
-      ].filter((line) => line !== "").join("\n")), "");
-    }
-    md.push("---", "");
-  }
-
   const turns = buildTraceTurns(main, events);
-  md.push(renderTraceSummary({ turns, subagents, events, rawDumps, tokens }), "", "---", "");
-  if (!turns.length) {
-    md.push("No conversation turns found.");
-  }
-  for (const turn of turns) {
-    if (turn.user) md.push("## User", "", turn.user, "");
-    md.push(renderTraceEnhancement(turn, meta), "");
-    const assistant = renderCc2mdAssistant(turn, subagentMaps.byId);
-    if (assistant) md.push("## Assistant", "", assistant, "");
-  }
 
-  if (subagents.length) {
-    md.push("---", "", "## Subagent Conversations", "");
-    for (const [file, sub] of subagentMaps.files.entries()) {
-      const subMeta = sessionMetaFromRollout(sub);
-      const desc = agentNicknameFromMeta(subMeta) || subMeta.id || path.basename(sub.file);
-      md.push(`- [→ Subagent: ${desc}](${file})`);
+  const renderMainMarkdown = (subagentPathPrefix) => {
+    const subagentLinks = new Map([...subagentMaps.byId.entries()].map(([id, file]) => [id, `${subagentPathPrefix}${file}`]));
+    const md = [`# ${title}`, "", renderTokenUsageOverview(turns), "", "---", "", `**Session:** \`${sessionId}\`  `, `**Project:** \`${project}\`  `];
+    if (ts) md.push(`**Date:** ${ts}  `);
+    md.push("", "---", "");
+    md.push(...formatCodexMetadata(collectCodexMetadata(main, runMeta)));
+    md.push("## Agent Trace Metadata", "");
+    md.push(`**Trace Directory:** \`${path.resolve(runDir)}\`  `);
+    md.push(`**Agent:** \`${runMeta.agent || "unknown"}\`  `);
+    md.push(`**Command:** \`${[runMeta.command, ...(runMeta.args || [])].filter(Boolean).join(" ")}\`  `);
+    if (runMeta.auth_mode) md.push(`**Auth Mode:** \`${runMeta.auth_mode}\`  `);
+    if (runMeta.base_url) md.push(`**Base URL:** \`${runMeta.base_url}\`  `);
+    md.push(`**Captured API Events:** \`${events.length}\`  `);
+    md.push(`**Captured Auth Headers:** \`${tokens.length}\`  `, "", "---", "");
+    if (tokens.length) {
+      md.push("## Captured Auth Headers", "");
+      const seen = new Set();
+      let index = 0;
+      for (const token of tokens) {
+        const key = `${token.header || ""}\n${token.value || token.preview || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        index += 1;
+        md.push(detailsBlock(`Token ${index}: ${token.header || "token"}`, [
+          token.timestamp ? `**Time:** \`${token.timestamp}\`  ` : "",
+          token.url ? `**URL:** \`${token.url}\`  ` : "",
+          "",
+          fence(token.preview || token.value || "", ""),
+        ].filter((line) => line !== "").join("\n")), "");
+      }
+      md.push("---", "");
     }
-    md.push("");
-  }
-  md.push("---", "", renderCapturedRequestLog(events, rawDumps, runDir));
+
+    md.push(renderTraceSummary({ turns, subagents, events, rawDumps, tokens }), "", "---", "");
+    if (!turns.length) {
+      md.push("No conversation turns found.");
+    }
+    for (const turn of turns) {
+      if (turn.user) md.push("## User", "", turn.user, "");
+      md.push(renderTraceEnhancement(turn, meta), "");
+      const assistant = renderCc2mdAssistant(turn, subagentLinks);
+      if (assistant) md.push("## Assistant", "", assistant, "");
+    }
+
+    if (subagents.length) {
+      md.push("---", "", "## Subagent Conversations", "");
+      for (const [file, sub] of subagentMaps.files.entries()) {
+        const subMeta = sessionMetaFromRollout(sub);
+        const desc = agentNicknameFromMeta(subMeta) || subMeta.id || path.basename(sub.file);
+        md.push(`- [→ Subagent: ${desc}](${subagentPathPrefix}${file})`);
+      }
+      md.push("");
+    }
+    md.push("---", "", renderCapturedRequestLog(events, rawDumps, runDir));
+    return `${md.join("\n")}\n`;
+  };
+
   const files = new Map();
+  files.set("main.md", renderMainMarkdown(""));
   for (const [file, rollout] of subagentMaps.files.entries()) {
     files.set(file, renderSubagentMarkdown(rollout, runMeta));
   }
-  return { content: `${md.join("\n")}\n`, files };
+  return { files };
 }
 
 function generateRunMarkdown(runDir, opts = {}) {
@@ -1383,14 +1426,18 @@ function generateRunMarkdown(runDir, opts = {}) {
   const rollouts = readRolloutsForRun(runMeta);
   const rendered = rollouts.length
     ? renderCc2mdTraceMarkdown({ runDir, runMeta, events, tokens, rollouts, rawDumps })
-    : { content: renderRequestOnlyTraceMarkdown({ runDir, runMeta, events, tokens, rawDumps }), files: new Map() };
-  const out = opts.outputFile || path.join(runDir, "report.md");
-  fs.writeFileSync(out, rendered.content);
-  const extraDir = path.dirname(out);
-  for (const [file, content] of rendered.files || []) {
-    fs.writeFileSync(path.join(extraDir, file), content);
+    : { files: new Map([["main.md", renderRequestOnlyTraceMarkdown({ runDir, runMeta, events, tokens, rawDumps })]]) };
+  if (opts.outputFile) {
+    const main = (rendered.files || new Map()).get("main.md") || "";
+    fs.writeFileSync(opts.outputFile, main);
+    return opts.outputFile;
   }
-  return out;
+  const outDir = path.join(runDir, "report-md");
+  mkdirp(outDir);
+  for (const [file, content] of rendered.files || []) {
+    fs.writeFileSync(path.join(outDir, file), content);
+  }
+  return outDir;
 }
 
 function renderLegacyJsonlMarkdown({ inputFile, events }) {
@@ -1456,7 +1503,7 @@ function renderClaudeUsage(event) {
 function renderRequestOnlyTraceMarkdown({ runDir, runMeta, events, tokens, rawDumps }) {
   const md = ["# Agent Trace Report", "", `**Session:** \`${path.basename(runDir)}\`  `, `**Project:** \`${process.cwd()}\`  `];
   if (runMeta.started_at) md.push(`**Date:** ${new Date(runMeta.started_at).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC")}  `);
-  md.push("", "---", "", "## Agent Trace Metadata", "");
+  md.push("", renderTokenUsageOverview([]), "", "---", "", "## Agent Trace Metadata", "");
   md.push(`**Trace Directory:** \`${path.resolve(runDir)}\`  `);
   md.push(`**Agent:** \`${runMeta.agent || "unknown"}\`  `);
   md.push(`**Command:** \`${[runMeta.command, ...(runMeta.args || [])].filter(Boolean).join(" ")}\`  `);
@@ -1478,7 +1525,7 @@ function renderRequestOnlyTraceMarkdown({ runDir, runMeta, events, tokens, rawDu
         token.timestamp ? `**Time:** \`${token.timestamp}\`  ` : "",
         token.url ? `**URL:** \`${token.url}\`  ` : "",
         "",
-        fence(token.value || token.preview || "", ""),
+        fence(token.preview || token.value || "", ""),
       ].filter((line) => line !== "").join("\n")), "");
     }
     md.push("---", "");
@@ -1492,7 +1539,6 @@ function renderRequestOnlyTraceMarkdown({ runDir, runMeta, events, tokens, rawDu
       body.push(renderClaudePromptSummary(event.request.body));
       const usage = renderClaudeUsage(event);
       if (usage) body.push("", usage);
-      body.push("", detailsBlock("Structured Request/Response", renderRequestEventDetails(event, event.request?.url || `request ${index + 1}`)));
       md.push(`### API Call ${index + 1}: ${requestEventMethod(event)} ${shortUrl(requestEventUrl(event))}`, "", body.filter(Boolean).join("\n"), "");
     });
     md.push("---", "");
@@ -1796,6 +1842,9 @@ function htmlShell({ title, subtitle, runMeta, sections }) {
     pre { overflow:auto; margin:0; padding:12px; border-top:1px solid var(--border); font-size:12px; }
     code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
     .pill { display:inline-block; border:1px solid var(--border); border-radius:999px; padding:2px 8px; margin:2px 4px 2px 0; color:var(--muted); }
+    table { width:100%; border-collapse:collapse; margin:10px 0; font-size:12px; }
+    th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); background:rgba(255,255,255,.03); }
   </style>
 </head>
 <body>
@@ -1814,10 +1863,7 @@ function htmlShell({ title, subtitle, runMeta, sections }) {
 function generateHtmlFromJsonl(inputFile, outputFile, opts = {}) {
   const events = readJsonl(inputFile);
   const summary = summarizeEvents(events);
-  const filtered = opts.includeAllRequests ? events : events.filter((event) => {
-    const messages = event.request?.body?.messages;
-    return !messages || messages.length > 2;
-  });
+  const filtered = events;
   const html = htmlShell({
     title: "Agent Trace Report",
     subtitle: path.resolve(inputFile),
@@ -1857,12 +1903,11 @@ function generateRunHtml(runDir, opts = {}) {
       log: fs.existsSync(logsFile) ? logsFile : "",
     },
     sections: [
-      `<h2>Summary</h2><div>${Object.entries(summary.counts).map(([k, v]) => `<span class="pill">${escapeHtml(k)}: ${v}</span>`).join("") || '<span class="muted">No JSONL events.</span>'}</div>`,
+      `<h2>Summary</h2><div>${Object.entries(summary.counts).map(([k, v]) => `<span class="pill">${escapeHtml(k)}: ${v}</span>`).join("") || '<span class="muted">No JSONL events.</span>'}<span class="pill">raw files: ${rawDumps.length}</span></div>`,
       `<h2>Conversation</h2>${renderConversationTurns(turns)}`,
       `<h2>Tokens</h2>${renderTokens(tokens)}`,
-      `<h2>Agent Log</h2>${events.map((event, index) => `<details ${index === 0 ? "open" : ""}><summary>${escapeHtml(event.type || event.request?.url || `event ${index + 1}`)}</summary><pre><code>${renderJson(event)}</code></pre></details>`).join("")}`,
-      `<h2>Codex Rollouts</h2>${rollouts.map((rollout) => `<details><summary>${escapeHtml(rollout.file)}</summary><div style="padding:0 12px 12px">${Object.entries(rollout.summary.counts).map(([k, v]) => `<span class="pill">${escapeHtml(k)}: ${v}</span>`).join("")}</div><pre><code>${renderJson(rollout.lines)}</code></pre></details>`).join("")}`,
-      `<h2>Raw Dumps</h2>${rawDumps.map((dump, index) => `<details ${index === 0 && !events.length ? "open" : ""}><summary>${escapeHtml(path.relative(runDir, dump.file))}</summary><pre><code>${renderJson(dump.data)}</code></pre></details>`).join("")}`,
+      `<h2>Request Overview</h2><p class="muted">Full request and response payloads are stored in <code>raw/*.json</code> and are not embedded in this report.</p>${renderRequestOverviewHtml(requestOverviewItems(events, runDir, rawDumps))}`,
+      `<h2>Codex Rollouts</h2>${rollouts.map((rollout) => `<div class="card"><b>${escapeHtml(rollout.file)}</b><br>${Object.entries(rollout.summary.counts).map(([k, v]) => `<span class="pill">${escapeHtml(k)}: ${v}</span>`).join("")}</div>`).join("")}`,
     ],
   });
   const out = opts.outputFile || path.join(runDir, "report.html");
@@ -1891,6 +1936,75 @@ function appendNodeOption(existing, loaderPath) {
   return existing ? `${existing} ${requireArg}` : requireArg;
 }
 
+function closeProxyNow(proxy) {
+  try {
+    if (proxy && typeof proxy.destroy === "function") proxy.destroy();
+    else if (proxy?.server && typeof proxy.server.close === "function") proxy.server.close();
+  } catch {
+    // Best effort during interrupted shutdown.
+  }
+}
+
+function saveRunReports(runDir, meta, { html = false } = {}) {
+  writeJson(path.join(runDir, "run.json"), meta);
+  const markdown = generateRunMarkdown(runDir);
+  const report = html ? generateRunHtml(runDir) : null;
+  return { report, markdown };
+}
+
+function startReportAutosave(runDir, buildMeta, intervalMs = 2000) {
+  let timer = null;
+  const save = () => {
+    try {
+      saveRunReports(runDir, buildMeta({ code: null, signal: null, pending: true }));
+    } catch {
+      // Autosave is best effort; finalization will surface real errors.
+    }
+  };
+  save();
+  timer = setInterval(save, intervalMs);
+  return {
+    save,
+    stop: () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+  };
+}
+
+function installRunFinalizers(child, finalize) {
+  const safeFinalize = (exit) => {
+    try {
+      finalize(exit);
+    } catch (error) {
+      console.error(`agent-trace: finalization failed: ${error.message || error}`);
+    }
+  };
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const signalHandlers = signals.map((signal) => {
+    const handler = () => {
+      try {
+        if (child && !child.killed) child.kill(signal);
+      } catch {
+        // Best effort: child may already be gone.
+      }
+      safeFinalize({ code: null, signal });
+      process.exit(signalExitCode(signal));
+    };
+    process.once(signal, handler);
+    return { signal, handler };
+  });
+  const beforeExitHandler = (code) => safeFinalize({ code, signal: null, reason: "beforeExit" });
+  const exitHandler = (code) => safeFinalize({ code, signal: null, reason: "exit" });
+  process.once("beforeExit", beforeExitHandler);
+  process.once("exit", exitHandler);
+  return () => {
+    for (const { signal, handler } of signalHandlers) process.removeListener(signal, handler);
+    process.removeListener("beforeExit", beforeExitHandler);
+    process.removeListener("exit", exitHandler);
+  };
+}
+
 async function runClaude(opts) {
   const startedMs = Date.now();
   const runDir = path.resolve(opts.traceDir, `trace-${stamp()}`);
@@ -1906,7 +2020,7 @@ async function runClaude(opts) {
     AGENT_TRACE_RUN_DIR: runDir,
     AGENT_TRACE_LOG_FILE: logFile,
     AGENT_TRACE_TOKEN_FILE: tokenFile,
-    AGENT_TRACE_INCLUDE_ALL_REQUESTS: String(opts.includeAllRequests),
+    AGENT_TRACE_INCLUDE_ALL_REQUESTS: "true",
     AGENT_TRACE_EXTRACT_TOKEN: String(opts.extractToken),
     ANTHROPIC_BASE_URL: baseUrl,
     CLAUDE_TRACE_API_ENDPOINT: baseUrl,
@@ -1921,18 +2035,28 @@ async function runClaude(opts) {
   console.log(`agent-trace: tracing Claude Code to ${runDir}`);
   console.log(`agent-trace: proxy listening on ${proxy.port}`);
   const child = spawn(opts.ccBin, opts.agentArgs, { cwd: process.cwd(), stdio: "inherit", env });
+  const exitPromise = waitForExit(child);
+  const buildMeta = (exit) => ({ agent: "cc", started_at: new Date(startedMs).toISOString(), finished_at: exit?.pending ? "" : new Date().toISOString(), command: opts.ccBin, args: opts.agentArgs, upstream_url: upstreamUrl, base_url: baseUrl, exit, log_file: logFile, token_file: tokenFile });
+  let autosave = { stop: () => {} };
+  let finalized = false;
+  const finalize = (exit) => {
+    if (finalized) return;
+    finalized = true;
+    autosave.stop();
+    closeProxyNow(proxy);
+    const { markdown } = saveRunReports(runDir, buildMeta(exit));
+    console.log(`agent-trace: Markdown report: ${markdown}`);
+  };
+  const cleanupSignals = installRunFinalizers(child, finalize);
+  autosave = startReportAutosave(runDir, buildMeta);
   let exit = { code: 1, signal: null };
   try {
-    exit = await waitForExitWithSignals(child);
+    exit = await exitPromise;
   } finally {
+    cleanupSignals();
     await shutdownProxy(proxy.port).catch((error) => console.error(`agent-trace: proxy shutdown failed: ${error.message || error}`));
   }
-  const meta = { agent: "cc", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.ccBin, args: opts.agentArgs, upstream_url: upstreamUrl, base_url: baseUrl, exit, log_file: logFile, token_file: tokenFile };
-  writeJson(path.join(runDir, "run.json"), meta);
-  const report = generateRunHtml(runDir);
-  const markdown = generateRunMarkdown(runDir);
-  console.log(`agent-trace: HTML report: ${report}`);
-  console.log(`agent-trace: Markdown report: ${markdown}`);
+  finalize(exit);
   process.exitCode = exit.code ?? signalExitCode(exit.signal);
 }
 
@@ -1948,583 +2072,71 @@ function readCodexAuth() {
   }
 }
 
+function codexAuthApiKey(auth) {
+  if (!auth || typeof auth !== "object") return "";
+  for (const key of ["OPENAI_API_KEY", "openai_api_key", "api_key", "apiKey"]) {
+    if (typeof auth[key] === "string" && auth[key]) return auth[key];
+  }
+  return "";
+}
+
+function isApiKeyAuthMode(authMode) {
+  return /^(api[-_ ]?key|apikey)$/i.test(String(authMode || ""));
+}
+
+function isChatGptAuthMode(authMode) {
+  return /^(chatgpt|chatgpt[-_ ]?login)$/i.test(String(authMode || ""));
+}
+
+function codexApiKeyAuth(opts, apiKey = "") {
+  return {
+    mode: "api-key",
+    configKey: "openai_base_url",
+    upstreamUrl: opts.upstreamUrl || "https://api.openai.com/v1",
+    openaiUpstreamUrl: opts.upstreamUrl || "https://api.openai.com/v1",
+    apiKey,
+  };
+}
+
 function resolveCodexAuth(opts) {
   if (!["auto", "api-key", "chatgpt-login"].includes(opts.auth)) throw new Error("--auth must be one of: auto, api-key, chatgpt-login");
-  if ((opts.auth === "auto" || opts.auth === "api-key") && process.env.OPENAI_API_KEY) {
-    return { mode: "api-key", configKey: "openai_base_url", upstreamUrl: opts.upstreamUrl || "https://api.openai.com/v1", openaiUpstreamUrl: opts.upstreamUrl || "https://api.openai.com/v1" };
-  }
-  if (opts.auth === "api-key") throw new Error("OPENAI_API_KEY is required when --auth api-key is used");
   const auth = readCodexAuth();
-  if (auth?.auth_mode || auth?.tokens?.access_token) {
+  const authFileApiKey = codexAuthApiKey(auth);
+  if ((opts.auth === "auto" || opts.auth === "api-key") && process.env.OPENAI_API_KEY) return codexApiKeyAuth(opts);
+  if ((opts.auth === "auto" || opts.auth === "api-key") && (authFileApiKey || isApiKeyAuthMode(auth?.auth_mode))) return codexApiKeyAuth(opts, authFileApiKey);
+  if (opts.auth === "api-key") throw new Error("OPENAI_API_KEY or an API-key Codex auth.json is required when --auth api-key is used");
+  if (auth?.tokens?.access_token || isChatGptAuthMode(auth?.auth_mode) || (auth?.auth_mode && !isApiKeyAuthMode(auth.auth_mode))) {
     return { mode: "chatgpt-login", configKey: "chatgpt_base_url", upstreamUrl: opts.upstreamUrl || "https://chatgpt.com/backend-api/codex", openaiUpstreamUrl: "https://api.openai.com/v1" };
   }
   throw new Error("no usable Codex auth found: set OPENAI_API_KEY or run codex login");
 }
 
-function sanitizeHeaders(headers) {
-  const out = { ...headers };
-  for (const key of Object.keys(out)) {
-    const lower = key.toLowerCase();
-    if (["authorization", "cookie", "set-cookie", "x-api-key"].includes(lower)) {
-      const value = Array.isArray(out[key]) ? out[key].join(", ") : String(out[key] || "");
-      out[key] = value.length > 16 ? `${value.slice(0, 8)}...${value.slice(-4)}` : "[REDACTED]";
-    }
-  }
-  return out;
-}
-
-function stripProxyHeaders(headers) {
-  const out = { ...headers };
-  for (const key of Object.keys(out)) {
-    if (["accept-encoding", "connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"].includes(key.toLowerCase())) delete out[key];
-  }
-  return out;
-}
-
-function responseHeadersForClient(headers) {
-  const out = stripProxyHeaders(headers);
-  delete out["content-encoding"];
-  delete out["content-length"];
-  return out;
-}
-
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
-function headerValue(headers, name) {
-  const lower = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers || {})) {
-    if (key.toLowerCase() === lower) return Array.isArray(value) ? value.join(", ") : String(value || "");
-  }
-  return "";
-}
-
-function decodeBodyBuffer(buffer, headers) {
-  const encoding = headerValue(headers, "content-encoding").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean).pop() || "";
-  if (!buffer.length || !encoding || encoding === "identity") return { buffer, encoding };
-  try {
-    if (encoding === "gzip" || encoding === "x-gzip") return { buffer: zlib.gunzipSync(buffer), encoding };
-    if (encoding === "br") return { buffer: zlib.brotliDecompressSync(buffer), encoding };
-    if (encoding === "deflate") return { buffer: zlib.inflateSync(buffer), encoding };
-    if (encoding === "zstd" && typeof zlib.zstdDecompressSync === "function") return { buffer: zlib.zstdDecompressSync(buffer), encoding };
-  } catch (error) {
-    return { buffer, encoding, decode_error: String(error) };
-  }
-  return { buffer, encoding, decode_error: `unsupported content-encoding: ${encoding}` };
-}
-
-function parseBody(buffer, headers) {
-  const decoded = decodeBodyBuffer(buffer, headers);
-  const text = decoded.buffer.toString("utf8");
-  if (!text) return null;
-  if (headerValue(headers, "content-type").includes("application/json")) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-  return text;
-}
-
-function bodyCapture(buffer, headers) {
-  const decoded = decodeBodyBuffer(buffer, headers);
+function codexProxyEnv(env, proxyPort, { caPem = "", apiKey = "" } = {}) {
+  const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   const out = {
-    body: parseBody(buffer, headers),
+    ...env,
+    HTTPS_PROXY: proxyUrl,
+    HTTP_PROXY: proxyUrl,
+    ALL_PROXY: proxyUrl,
+    https_proxy: proxyUrl,
+    http_proxy: proxyUrl,
+    all_proxy: proxyUrl,
   };
-  if (buffer.length) {
-    out.body_base64 = buffer.toString("base64");
-    out.body_sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
-  }
-  if (decoded.encoding) out.body_content_encoding = decoded.encoding;
-  if (decoded.decode_error) out.body_decode_error = decoded.decode_error;
-  if (decoded.buffer !== buffer) out.body_decoded_sha256 = crypto.createHash("sha256").update(decoded.buffer).digest("hex");
+  out.NO_PROXY = ["127.0.0.1", "localhost", out.NO_PROXY || out.no_proxy || ""].filter(Boolean).join(",");
+  out.no_proxy = out.NO_PROXY;
+  if (caPem) out.CODEX_CA_CERTIFICATE = caPem;
+  if (apiKey && !out.OPENAI_API_KEY) out.OPENAI_API_KEY = apiKey;
   return out;
 }
 
-function writeJsonl(file, event) {
-  fs.appendFileSync(file, `${JSON.stringify(event)}\n`);
-}
-
-function writeTokenFile(file, event) {
-  fs.appendFileSync(file, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+function removeMitmArtifacts(runDir) {
+  const dir = path.join(runDir, "mitm");
   try {
-    fs.chmodSync(file, 0o600);
+    fs.rmSync(dir, { recursive: true, force: true });
+    return !fs.existsSync(dir);
   } catch {
-    // Best effort.
+    return false;
   }
-}
-
-function routeTarget(reqUrl, upstreamUrl, openaiUpstreamUrl) {
-  const text = String(reqUrl || "/");
-  const base = text === "/v1" || text.startsWith("/v1/") ? new URL(openaiUpstreamUrl || upstreamUrl) : new URL(upstreamUrl);
-  const target = new URL(text, base);
-  if (base.pathname !== "/" && !target.pathname.startsWith(base.pathname)) target.pathname = path.posix.join(base.pathname, target.pathname);
-  return target;
-}
-
-function parseMaybeJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
-}
-
-function parseWebSocketFrames() {
-  let buffer = Buffer.alloc(0);
-  return (chunk) => {
-    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
-    const frames = [];
-    while (buffer.length >= 2) {
-      const first = buffer[0];
-      const second = buffer[1];
-      const opcode = first & 0x0f;
-      const masked = Boolean(second & 0x80);
-      let len = second & 0x7f;
-      let offset = 2;
-      if (len === 126) {
-        if (buffer.length < offset + 2) break;
-        len = buffer.readUInt16BE(offset);
-        offset += 2;
-      } else if (len === 127) {
-        if (buffer.length < offset + 8) break;
-        const bigLen = buffer.readBigUInt64BE(offset);
-        if (bigLen > BigInt(Number.MAX_SAFE_INTEGER)) break;
-        len = Number(bigLen);
-        offset += 8;
-      }
-      let mask;
-      if (masked) {
-        if (buffer.length < offset + 4) break;
-        mask = buffer.subarray(offset, offset + 4);
-        offset += 4;
-      }
-      if (buffer.length < offset + len) break;
-      let payload = Buffer.from(buffer.subarray(offset, offset + len));
-      if (masked) {
-        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
-      }
-      buffer = buffer.subarray(offset + len);
-      frames.push({ opcode, payload });
-    }
-    return frames;
-  };
-}
-
-function decodeWebSocketPayload(payload) {
-  const attempts = [
-    ["identity", (value) => value],
-    ["deflate-raw", (value) => zlib.inflateRawSync(value, { finishFlush: zlib.constants.Z_SYNC_FLUSH })],
-    ["deflate", (value) => zlib.inflateSync(value, { finishFlush: zlib.constants.Z_SYNC_FLUSH })],
-    ["gzip", (value) => zlib.gunzipSync(value)],
-    ["br", (value) => zlib.brotliDecompressSync(value)],
-  ];
-  if (typeof zlib.zstdDecompressSync === "function") attempts.push(["zstd", (value) => zlib.zstdDecompressSync(value)]);
-  for (const [encoding, decode] of attempts) {
-    try {
-      const buffer = decode(payload);
-      const text = buffer.toString("utf8");
-      if (text && !text.includes("\ufffd")) return { encoding, buffer, text, parsed: parseMaybeJson(text) };
-    } catch {
-      // Try the next websocket payload encoding.
-    }
-  }
-  return null;
-}
-
-function logWebSocketFrames(logFile, direction, meta = {}) {
-  const parser = parseWebSocketFrames();
-  let handshakeDone = direction === "client_to_upstream";
-  let pending = Buffer.alloc(0);
-  return (chunk) => {
-    let data = Buffer.from(chunk);
-    if (!handshakeDone) {
-      pending = Buffer.concat([pending, data]);
-      const marker = pending.indexOf("\r\n\r\n");
-      if (marker === -1) return;
-      data = pending.subarray(marker + 4);
-      pending = Buffer.alloc(0);
-      handshakeDone = true;
-      if (!data.length) return;
-    }
-    for (const frame of parser(data)) {
-      const event = { type: "websocket_frame", timestamp: new Date().toISOString(), direction, opcode: frame.opcode, ...meta };
-      if (frame.payload.length) {
-        event.body_base64 = frame.payload.toString("base64");
-        event.body_sha256 = crypto.createHash("sha256").update(frame.payload).digest("hex");
-      }
-      if (frame.opcode === 1) {
-        const decoded = decodeWebSocketPayload(frame.payload);
-        if (decoded) {
-          event.body = decoded.parsed;
-          event.body_encoding = decoded.encoding;
-          if (decoded.encoding !== "identity") {
-            event.body_decoded_sha256 = crypto.createHash("sha256").update(decoded.buffer).digest("hex");
-          }
-        }
-      }
-      writeJsonl(logFile, event);
-    }
-  };
-}
-
-function proxyUrlFor(target) {
-  if (process.env.NO_PROXY || process.env.no_proxy) {
-    const noProxy = String(process.env.NO_PROXY || process.env.no_proxy);
-    if (noProxy.split(",").map((item) => item.trim()).some((item) => item && target.hostname.endsWith(item.replace(/^\./, "")))) return null;
-  }
-  return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy || null;
-}
-
-function connectTls(target, onConnect, onError) {
-  const targetPort = target.port ? Number(target.port) : 443;
-  const proxy = proxyUrlFor(target);
-  if (!proxy) {
-    const socket = tls.connect({ host: target.hostname, port: targetPort, servername: target.hostname }, () => onConnect(socket));
-    socket.on("error", onError);
-    return socket;
-  }
-
-  const proxyTarget = new URL(proxy);
-  const proxySocket = net.connect(Number(proxyTarget.port || 80), proxyTarget.hostname);
-  proxySocket.on("error", onError);
-  proxySocket.once("connect", () => {
-    proxySocket.write(`CONNECT ${target.hostname}:${targetPort} HTTP/1.1\r\nHost: ${target.hostname}:${targetPort}\r\n\r\n`);
-  });
-  let response = Buffer.alloc(0);
-  proxySocket.on("data", function onProxyData(chunk) {
-    response = Buffer.concat([response, chunk]);
-    const marker = response.indexOf("\r\n\r\n");
-    if (marker === -1) return;
-    proxySocket.off("data", onProxyData);
-    const head = response.subarray(0, marker).toString("utf8");
-    const rest = response.subarray(marker + 4);
-    if (!/^HTTP\/1\.[01] 200\b/.test(head)) {
-      onError(new Error(`proxy CONNECT failed: ${head.split("\r\n")[0]}`));
-      proxySocket.destroy();
-      return;
-    }
-    const tlsSocket = tls.connect({ socket: proxySocket, servername: target.hostname }, () => {
-      if (rest.length) tlsSocket.unshift(rest);
-      onConnect(tlsSocket);
-    });
-    tlsSocket.on("error", onError);
-  });
-  return proxySocket;
-}
-
-function connectRawTarget(host, port, onConnect, onError) {
-  const proxy = proxyUrlFor({ hostname: host });
-  if (!proxy) {
-    const socket = net.connect(Number(port), host, () => onConnect(socket));
-    socket.on("error", onError);
-    return socket;
-  }
-
-  const proxyTarget = new URL(proxy);
-  const proxySocket = net.connect(Number(proxyTarget.port || 80), proxyTarget.hostname);
-  proxySocket.on("error", onError);
-  proxySocket.once("connect", () => {
-    proxySocket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
-  });
-  let response = Buffer.alloc(0);
-  proxySocket.on("data", function onProxyData(chunk) {
-    response = Buffer.concat([response, chunk]);
-    const marker = response.indexOf("\r\n\r\n");
-    if (marker === -1) return;
-    proxySocket.off("data", onProxyData);
-    const head = response.subarray(0, marker).toString("utf8");
-    const rest = response.subarray(marker + 4);
-    if (!/^HTTP\/1\.[01] 200\b/.test(head)) {
-      onError(new Error(`proxy CONNECT failed: ${head.split("\r\n")[0]}`));
-      proxySocket.destroy();
-      return;
-    }
-    if (rest.length) proxySocket.unshift(rest);
-    onConnect(proxySocket);
-  });
-  return proxySocket;
-}
-
-function ensureCodexMitmCerts(runDir) {
-  const certDir = path.join(runDir, "mitm");
-  mkdirp(certDir);
-  const caKey = path.join(certDir, "agent-trace-ca.key");
-  const caPem = path.join(certDir, "agent-trace-ca.pem");
-  const hostKey = path.join(certDir, "chatgpt.com.key");
-  const hostCsr = path.join(certDir, "chatgpt.com.csr");
-  const hostPem = path.join(certDir, "chatgpt.com.pem");
-  const hostConf = path.join(certDir, "chatgpt.com.cnf");
-  if (!fs.existsSync(caPem)) {
-    execFileSync("openssl", ["genrsa", "-out", caKey, "2048"], { stdio: "ignore" });
-    execFileSync("openssl", ["req", "-x509", "-new", "-nodes", "-key", caKey, "-sha256", "-days", "30", "-subj", "/CN=agent-trace local CA", "-out", caPem], { stdio: "ignore" });
-  }
-  if (!fs.existsSync(hostPem)) {
-    fs.writeFileSync(hostConf, [
-      "[req]",
-      "distinguished_name=req_distinguished_name",
-      "req_extensions=v3_req",
-      "prompt=no",
-      "[req_distinguished_name]",
-      "CN=chatgpt.com",
-      "[v3_req]",
-      "subjectAltName=@alt_names",
-      "[alt_names]",
-      "DNS.1=chatgpt.com",
-      "DNS.2=*.chatgpt.com",
-      "",
-    ].join("\n"));
-    execFileSync("openssl", ["genrsa", "-out", hostKey, "2048"], { stdio: "ignore" });
-    execFileSync("openssl", ["req", "-new", "-key", hostKey, "-out", hostCsr, "-config", hostConf], { stdio: "ignore" });
-    execFileSync("openssl", ["x509", "-req", "-in", hostCsr, "-CA", caPem, "-CAkey", caKey, "-CAcreateserial", "-out", hostPem, "-days", "30", "-sha256", "-extfile", hostConf, "-extensions", "v3_req"], { stdio: "ignore" });
-  }
-  return { caPem, key: fs.readFileSync(hostKey), cert: fs.readFileSync(hostPem) };
-}
-
-function parseHttpHead(buffer) {
-  const marker = buffer.indexOf("\r\n\r\n");
-  if (marker === -1) return null;
-  const head = buffer.subarray(0, marker).toString("utf8");
-  const rest = buffer.subarray(marker + 4);
-  const lines = head.split("\r\n");
-  const [method, target, version] = lines.shift().split(" ");
-  const headers = {};
-  for (const line of lines) {
-    const index = line.indexOf(":");
-    if (index === -1) continue;
-    const key = line.slice(0, index).toLowerCase();
-    const value = line.slice(index + 1).trim();
-    if (headers[key]) headers[key] = `${headers[key]}, ${value}`;
-    else headers[key] = value;
-  }
-  return { method, target, version, headers, rawHead: head, rest };
-}
-
-function startCodexMitmProxy({ port, runDir, logFile, tokenFile, extractToken, certs }) {
-  let counter = 0;
-  const rawDir = path.join(runDir, "raw");
-  mkdirp(rawDir);
-  const secureContext = tls.createSecureContext({ key: certs.key, cert: certs.cert });
-  const sockets = new Set();
-  const server = http.createServer((req, res) => {
-    if (req.url === "/shutdown") {
-      res.writeHead(200).end("ok");
-      for (const socket of sockets) socket.destroy();
-      server.close();
-      return;
-    }
-    res.writeHead(501).end("agent-trace MITM proxy only supports CONNECT");
-  });
-  server.on("connect", (req, clientSocket, head) => {
-    ignoreSocketErrors(clientSocket);
-    sockets.add(clientSocket);
-    clientSocket.on("close", () => sockets.delete(clientSocket));
-    const [host, portText = "443"] = String(req.url || "").split(":");
-    const targetPort = Number(portText || 443);
-    if (host !== "chatgpt.com" || targetPort !== 443) {
-      connectRawTarget(host, targetPort, (upstream) => {
-        ignoreSocketErrors(upstream);
-        sockets.add(upstream);
-        upstream.on("close", () => sockets.delete(upstream));
-        safeSocketWrite(clientSocket, "HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head.length) safeSocketWrite(upstream, head);
-        upstream.pipe(clientSocket);
-        clientSocket.pipe(upstream);
-      }, (error) => clientSocket.destroy(error));
-      return;
-    }
-
-    safeSocketWrite(clientSocket, "HTTP/1.1 200 Connection Established\r\n\r\n");
-    const tlsSocket = new tls.TLSSocket(clientSocket, { isServer: true, secureContext, ALPNProtocols: ["http/1.1"] });
-    ignoreSocketErrors(tlsSocket);
-    let initial = Buffer.alloc(0);
-    tlsSocket.on("data", function onInitialData(chunk) {
-      initial = Buffer.concat([initial, chunk]);
-      const parsed = parseHttpHead(initial);
-      if (!parsed) return;
-      tlsSocket.off("data", onInitialData);
-      const id = `${String(++counter).padStart(4, "0")}-${Date.now()}`;
-      const started = Date.now();
-      const target = new URL(parsed.target, "https://chatgpt.com");
-      const requestRecord = { timestamp: new Date(started).toISOString(), method: parsed.method, url: target.toString(), headers: sanitizeHeaders(parsed.headers), mitm: true };
-      if (extractToken) {
-        for (const token of extractTokenHeaders(parsed.headers)) {
-          writeTokenFile(tokenFile, { timestamp: new Date(started).toISOString(), url: target.toString(), header: token.header, preview: tokenPreview(token.value), value: token.value });
-        }
-      }
-      connectTls(target, (upstream) => {
-        ignoreSocketErrors(upstream);
-        sockets.add(upstream);
-        upstream.on("close", () => sockets.delete(upstream));
-        const upstreamHead = parsed.rawHead
-          .replace(/^Host: .*$/im, "Host: chatgpt.com")
-          .replace(/^Sec-WebSocket-Extensions:.*\r?\n/im, "");
-        safeSocketWrite(upstream, `${upstreamHead}\r\n\r\n`);
-        if (parsed.rest.length) safeSocketWrite(upstream, parsed.rest);
-        const isWebSocket = /websocket/i.test(parsed.headers.upgrade || "") || /\/backend-api\/codex\/responses\b/.test(target.pathname);
-        let wroteClose = false;
-        const close = (error) => {
-          if (wroteClose) return;
-          wroteClose = true;
-          const event = { type: isWebSocket ? "websocket_connection" : "mitm_connection", request: requestRecord, duration_ms: Date.now() - started };
-          if (error) event.error = String(error);
-          try {
-            fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(event, null, 2));
-            writeJsonl(logFile, event);
-          } catch {
-            // Best effort; process shutdown can close files underneath us.
-          }
-        };
-        if (isWebSocket) {
-          const frameMeta = { url: target.toString(), websocket: true };
-          const clientLogger = logWebSocketFrames(logFile, "client_to_upstream", frameMeta);
-          const upstreamLogger = logWebSocketFrames(logFile, "upstream_to_client", frameMeta);
-          if (parsed.rest.length) clientLogger(parsed.rest);
-          tlsSocket.on("data", (data) => {
-            clientLogger(data);
-            safeSocketWrite(upstream, data);
-          });
-          upstream.on("data", (data) => {
-            upstreamLogger(data);
-            safeSocketWrite(tlsSocket, data);
-          });
-        } else {
-          tlsSocket.pipe(upstream);
-          upstream.pipe(tlsSocket);
-        }
-        upstream.on("error", close);
-        tlsSocket.on("error", close);
-        upstream.on("close", () => close());
-        tlsSocket.on("close", () => close());
-      }, (error) => tlsSocket.destroy(error));
-    });
-    tlsSocket.on("error", () => clientSocket.destroy());
-  });
-  return new Promise((resolve, reject) => {
-    server.on("error", reject);
-    server.listen(port ? Number(port) : 0, "127.0.0.1", () => resolve({
-      server,
-      port: server.address().port,
-      caPem: certs.caPem,
-      destroy: () => {
-        for (const socket of sockets) socket.destroy();
-        server.close();
-      },
-    }));
-  });
-}
-
-function startForwardProxy({ port, upstreamUrl, openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken }) {
-  let counter = 0;
-  const rawDir = path.join(runDir, "raw");
-  mkdirp(rawDir);
-  const server = http.createServer(async (req, res) => {
-    if (req.url === "/shutdown") {
-      res.writeHead(200).end("ok");
-      server.close();
-      return;
-    }
-    const id = `${String(++counter).padStart(4, "0")}-${Date.now()}`;
-    const started = Date.now();
-    const requestBody = await readRequestBody(req);
-    const target = routeTarget(req.url, upstreamUrl, openaiUpstreamUrl);
-    const requestRecord = { timestamp: new Date(started).toISOString(), method: req.method, url: target.toString(), headers: sanitizeHeaders(req.headers), ...bodyCapture(requestBody, req.headers) };
-    if (extractToken) {
-      for (const token of extractTokenHeaders(req.headers)) {
-        writeTokenFile(tokenFile, { timestamp: new Date(started).toISOString(), url: target.toString(), header: token.header, preview: tokenPreview(token.value), value: token.value });
-      }
-    }
-    try {
-      const upstreamResponse = await fetch(target, { method: req.method, headers: stripProxyHeaders(req.headers), body: requestBody.length ? requestBody : undefined, redirect: "manual" });
-      const responseHeaders = Object.fromEntries(upstreamResponse.headers.entries());
-      res.writeHead(upstreamResponse.status, responseHeadersForClient(responseHeaders));
-      const chunks = [];
-      if (upstreamResponse.body) {
-        for await (const chunk of Readable.fromWeb(upstreamResponse.body)) {
-          chunks.push(Buffer.from(chunk));
-          res.write(chunk);
-        }
-      }
-      res.end();
-      const responseBody = Buffer.concat(chunks);
-      const pair = { type: "api_pair", request: requestRecord, response: { timestamp: new Date().toISOString(), status_code: upstreamResponse.status, headers: sanitizeHeaders(responseHeaders), ...bodyCapture(responseBody, responseHeaders) }, duration_ms: Date.now() - started };
-      fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(pair, null, 2));
-      writeJsonl(logFile, pair);
-    } catch (error) {
-      const pair = { type: "api_pair", request: requestRecord, error: String(error), duration_ms: Date.now() - started };
-      fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(pair, null, 2));
-      writeJsonl(logFile, pair);
-      if (!res.headersSent) res.writeHead(502);
-      res.end(String(error));
-    }
-  });
-  server.on("upgrade", (req, socket, head) => {
-    const id = `${String(++counter).padStart(4, "0")}-${Date.now()}`;
-    const started = Date.now();
-    const target = routeTarget(req.url, upstreamUrl, openaiUpstreamUrl);
-    const requestRecord = { timestamp: new Date(started).toISOString(), method: req.method, url: target.toString(), headers: sanitizeHeaders(req.headers), websocket: true };
-    if (extractToken) {
-      for (const token of extractTokenHeaders(req.headers)) {
-        writeTokenFile(tokenFile, { timestamp: new Date(started).toISOString(), url: target.toString(), header: token.header, preview: tokenPreview(token.value), value: token.value });
-      }
-    }
-    let upstream;
-    let wroteClose = false;
-    const close = (error) => {
-      if (wroteClose) return;
-      wroteClose = true;
-      const event = { type: "websocket_connection", request: requestRecord, duration_ms: Date.now() - started };
-      if (error) event.error = String(error);
-      fs.writeFileSync(path.join(rawDir, `${id}.json`), JSON.stringify(event, null, 2));
-      writeJsonl(logFile, event);
-    };
-    const onError = (error) => {
-      close(error);
-      socket.destroy(error);
-    };
-    upstream = connectTls(target, (tlsSocket) => {
-      upstream = tlsSocket;
-      const headers = stripProxyHeaders(req.headers);
-      delete headers["sec-websocket-extensions"];
-      const lines = [`GET ${target.pathname}${target.search} HTTP/1.1`, `Host: ${target.host}`, "Upgrade: websocket", "Connection: Upgrade"];
-      for (const [key, value] of Object.entries(headers)) {
-        if (Array.isArray(value)) for (const item of value) lines.push(`${key}: ${item}`);
-        else if (value !== undefined) lines.push(`${key}: ${value}`);
-      }
-      upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
-      if (head?.length) upstream.write(head);
-      tlsSocket.on("data", logWebSocketFrames(logFile, "upstream_to_client"));
-      socket.pipe(tlsSocket);
-      tlsSocket.pipe(socket);
-      tlsSocket.on("error", onError);
-      tlsSocket.on("close", () => close());
-    }, onError);
-    socket.on("data", logWebSocketFrames(logFile, "client_to_upstream"));
-    socket.on("error", (error) => {
-      close(error);
-      upstream.destroy(error);
-    });
-  });
-  return new Promise((resolve, reject) => {
-    server.on("error", reject);
-    server.listen(port ? Number(port) : 0, "127.0.0.1", () => resolve({ server, port: server.address().port }));
-  });
-}
-
-async function shutdownProxy(port) {
-  await new Promise((resolve) => {
-    const socket = net.connect(Number(port), "127.0.0.1", () => socket.end("GET /shutdown HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"));
-    socket.on("error", resolve);
-    socket.on("close", resolve);
-    socket.setTimeout(1000, () => socket.destroy());
-  });
 }
 
 function findRecentCodexRollouts(startMs) {
@@ -2574,28 +2186,36 @@ async function runCodex(opts) {
   const proxy = useLoginMitm
     ? await startCodexMitmProxy({ port: opts.port, runDir, logFile, tokenFile, extractToken: opts.extractToken, certs: ensureCodexMitmCerts(runDir) })
     : await startForwardProxy({ port: opts.port, upstreamUrl: auth.upstreamUrl, openaiUpstreamUrl: auth.openaiUpstreamUrl, runDir, logFile, tokenFile, extractToken: opts.extractToken });
-  const baseUrl = opts.baseUrl || (auth.mode === "api-key" ? `http://127.0.0.1:${proxy.port}/v1` : `http://127.0.0.1:${proxy.port}`);
+  const baseUrl = auth.mode === "api-key" ? `http://127.0.0.1:${proxy.port}/v1` : `http://127.0.0.1:${proxy.port}`;
   const args = useLoginMitm ? ["--disable", "apps", ...opts.agentArgs] : ["-c", `${auth.configKey}="${baseUrl}"`, ...opts.agentArgs];
-  const env = useLoginMitm
-    ? { ...process.env, HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`, HTTP_PROXY: `http://127.0.0.1:${proxy.port}`, ALL_PROXY: `http://127.0.0.1:${proxy.port}`, https_proxy: `http://127.0.0.1:${proxy.port}`, http_proxy: `http://127.0.0.1:${proxy.port}`, all_proxy: `http://127.0.0.1:${proxy.port}`, CODEX_CA_CERTIFICATE: proxy.caPem }
-    : process.env;
+  const env = codexProxyEnv(process.env, proxy.port, { caPem: useLoginMitm ? proxy.caPem : "", apiKey: auth.apiKey });
   writeJson(path.join(runDir, "codex-command.json"), { command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy" });
   console.log(`agent-trace: proxy listening on ${proxy.port}${useLoginMitm ? " (Codex HTTPS MITM)" : ""}`);
   console.log(`agent-trace: tracing Codex to ${runDir}`);
   const child = spawn(opts.codexBin, args, { cwd: process.cwd(), stdio: "inherit", env });
+  const exitPromise = waitForExit(child);
+  const buildMeta = (exit) => ({ agent: "codex", started_at: new Date(startedMs).toISOString(), finished_at: exit?.pending ? "" : new Date().toISOString(), command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy", upstream_url: auth.upstreamUrl, openai_upstream_url: auth.openaiUpstreamUrl, base_url: useLoginMitm ? null : baseUrl, mitm_artifacts_removed: exit?.pending ? null : (useLoginMitm ? removeMitmArtifacts(runDir) : null), exit, log_file: logFile, token_file: tokenFile, rollouts: findRecentCodexRollouts(startedMs) });
+  let autosave = { stop: () => {} };
+  let finalized = false;
+  const finalize = (exit) => {
+    if (finalized) return;
+    finalized = true;
+    autosave.stop();
+    closeProxyNow(proxy);
+    const { markdown } = saveRunReports(runDir, buildMeta(exit));
+    console.log(`agent-trace: Markdown report: ${markdown}`);
+  };
+  const cleanupSignals = installRunFinalizers(child, finalize);
+  autosave = startReportAutosave(runDir, buildMeta);
   let exit = { code: 1, signal: null };
   try {
-    exit = await waitForExitWithSignals(child);
+    exit = await exitPromise;
   } finally {
+    cleanupSignals();
     if (useLoginMitm && typeof proxy.destroy === "function") proxy.destroy();
     else await shutdownProxy(proxy.port).catch((error) => console.error(`agent-trace: proxy shutdown failed: ${error.message || error}`));
   }
-  const meta = { agent: "codex", started_at: new Date(startedMs).toISOString(), finished_at: new Date().toISOString(), command: opts.codexBin, args, auth_mode: auth.mode, capture_mode: useLoginMitm ? "https-connect-mitm" : "base-url-forward-proxy", upstream_url: auth.upstreamUrl, openai_upstream_url: auth.openaiUpstreamUrl, base_url: useLoginMitm ? null : baseUrl, mitm_ca: useLoginMitm ? proxy.caPem : null, exit, log_file: logFile, token_file: tokenFile, rollouts: findRecentCodexRollouts(startedMs) };
-  writeJson(path.join(runDir, "run.json"), meta);
-  const report = generateRunHtml(runDir);
-  const markdown = generateRunMarkdown(runDir);
-  console.log(`agent-trace: HTML report: ${report}`);
-  console.log(`agent-trace: Markdown report: ${markdown}`);
+  finalize(exit);
   process.exitCode = exit.code ?? signalExitCode(exit.signal);
 }
 
@@ -2613,7 +2233,7 @@ async function main() {
   }
   if (opts.generateMd) {
     if (fs.existsSync(opts.generateMd) && fs.statSync(opts.generateMd).isDirectory()) {
-      console.log(`Markdown report: ${generateRunMarkdown(opts.generateMd, { outputFile: opts.mdOut || path.join(opts.generateMd, "report.md") })}`);
+      console.log(`Markdown report: ${generateRunMarkdown(opts.generateMd, opts.mdOut ? { outputFile: opts.mdOut } : {})}`);
       return;
     }
     const out = opts.mdOut || opts.generateMd.replace(/\.jsonl$/i, ".md");
